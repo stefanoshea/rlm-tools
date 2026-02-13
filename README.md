@@ -1,5 +1,7 @@
 # RLM Tools
 
+<!-- mcp-name: io.github.stefanoshea/rlm-tools -->
+
 Your AI coding agent spends most of its token budget just *reading* your code — not reasoning about it. Every grep, file read, and glob result gets dumped into the conversation. On a large codebase, that's 25-35% of your context (and cost) burned on raw data the model never needed to see.
 
 RLM Tools gives your agent a persistent sandbox to explore code in. Data stays server-side. Only the conclusions come back.

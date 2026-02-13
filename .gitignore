@@ -9,3 +9,5 @@ dist/
 .mcp.local.json
 evals/ab_results/
 docs/plans/
+.claude/
+.mcpregistry_*

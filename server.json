@@ -1,0 +1,23 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.stefanoshea/rlm-tools",
+  "title": "RLM Tools",
+  "description": "Persistent Python sandbox for token-efficient codebase exploration in MCP clients",
+  "version": "0.1.0",
+  "websiteUrl": "https://github.com/stefanoshea/rlm-tools",
+  "repository": {
+    "url": "https://github.com/stefanoshea/rlm-tools",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "rlm-tools",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
