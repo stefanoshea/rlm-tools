@@ -12,6 +12,7 @@ dependencies = [
 
 [project.scripts]
 rlm-tools = "rlm_tools.server:main"
+rlm-tools-setup = "rlm_tools.setup_cli:main"
 
 [build-system]
 requires = ["hatchling"]

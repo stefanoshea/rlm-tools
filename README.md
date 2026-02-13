@@ -5,14 +5,24 @@ Your AI coding agent spends most of its token budget just *reading* your code â€
 RLM Tools gives your agent a persistent sandbox to explore code in. Data stays server-side. Only the conclusions come back.
 
 ```bash
-# Install in one line (Claude Code)
-claude mcp add rlm-tools -- uvx rlm-tools
+# For Codex / generic MCP clients
+uvx rlm-tools-setup --write-policy AGENTS.md
 
-# Or Codex
-codex mcp add rlm-tools -- uvx rlm-tools
+# For Claude Code
+uvx rlm-tools-setup --write-policy CLAUDE.md
 ```
 
-That's it. Your agent automatically uses the sandbox for exploration. No config, no prompting changes.
+This auto-detects Claude/Codex on your PATH, registers the MCP server, and writes a policy block that nudges agents toward `rlm-tools` for repo exploration. Use `CLAUDE.md` for Claude Code (it reads this file automatically) or `AGENTS.md` for other clients.
+
+If you prefer manual setup:
+
+```bash
+# Claude Code
+claude mcp add rlm-tools -- uvx rlm-tools
+
+# Codex
+codex mcp add rlm-tools -- uvx rlm-tools
+```
 
 ## What Changes
 
@@ -73,6 +83,10 @@ Variables persist across `rlm_execute` calls within a session. The agent can bui
 
 RLM Tools is a standard [MCP](https://modelcontextprotocol.io) server. It works with any MCP-compatible client: **Claude Code**, **Codex**, **Cursor**, and others.
 
+### Optional Strict Mode
+
+If your MCP client supports tool permissions or hooks, disable/block default read/grep/glob tools for repository exploration and keep `rlm-tools` enabled. This is the strongest way to force the token-efficient path.
+
 <details>
 <summary><strong>Other installation methods</strong></summary>
 
@@ -87,6 +101,19 @@ RLM Tools is a standard [MCP](https://modelcontextprotocol.io) server. It works 
     }
   }
 }
+```
+
+### Setup helper command
+
+```bash
+# Auto-detect Claude/Codex CLIs and configure rlm-tools
+uvx rlm-tools-setup
+
+# Print JSON config snippet for other clients
+uvx rlm-tools-setup --print-json
+
+# Print policy text instead of writing it
+uvx rlm-tools-setup --print-policy
 ```
 
 ### Direct run
