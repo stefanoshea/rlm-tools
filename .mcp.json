@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "rlm-tools": {
+      "command": "uvx",
+      "args": ["rlm-tools"],
+      "env": {
+        "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}"
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+dist/
+*.egg-info/
+.pytest_cache/
+.env
+.mcp.local.json
+evals/ab_results/
+docs/plans/
