@@ -52,7 +52,7 @@ def _scan_metadata(path: str) -> dict:
             if ext not in _BINARY_EXTENSIONS:
                 try:
                     fpath = os.path.join(dirpath, fname)
-                    with open(fpath, errors="replace") as f:
+                    with open(fpath, encoding="utf-8-sig", errors="replace") as f:
                         file_line_count = sum(1 for _ in f)
                     total_lines += file_line_count
 
@@ -163,7 +163,7 @@ def _rlm_start(
         "read_files(paths) -> dict[path, content]",
         "grep(pattern, path='.')",
         "grep_summary(pattern, path='.') -> compact grouped string",
-        "grep_read(pattern, path='.', max_files=10, context_lines=0) -> {matches, files, summary}",
+        "grep_read(pattern, path='.', max_files=10, context_lines=0, include_files=False) -> {matches: dict[filepath, list[{file,line_number,line}]], files: dict, summary: str}",
         "glob_files(pattern)",
         "tree(path='.', max_depth=3)",
     ]

@@ -45,7 +45,7 @@ def make_helpers(base_path: str) -> tuple[dict, callable]:
         cache_key = str(target)
         if cache_key in _file_cache:
             return _file_cache[cache_key]
-        content = target.read_text(errors="replace")
+        content = target.read_text(encoding="utf-8-sig", errors="replace")
         _file_cache[cache_key] = content
         return content
 
@@ -76,7 +76,7 @@ def make_helpers(base_path: str) -> tuple[dict, callable]:
             if ext in _BINARY_EXTENSIONS:
                 continue
             try:
-                for i, line in enumerate(file_path.read_text(errors="replace").splitlines(), 1):
+                for i, line in enumerate(file_path.read_text(encoding="utf-8-sig", errors="replace").splitlines(), 1):
                     if compiled.search(line):
                         results.append({
                             "file": str(file_path.relative_to(base)),
@@ -109,17 +109,25 @@ def make_helpers(base_path: str) -> tuple[dict, callable]:
         path: str = ".",
         max_files: int = 10,
         context_lines: int = 0,
+        include_files: bool = False,
     ) -> dict:
-        """Grep then auto-read matching files. Returns match info + file contents.
+        """Grep then optionally read matching files.
 
         Args:
             pattern: Regex pattern to search for.
             path: Directory or file to search in.
             max_files: Maximum number of matching files to read (default 10).
             context_lines: Lines of context around each match (default 0).
+                           When > 0, 'files' contains excerpts around matches.
+            include_files: Whether to populate 'files' dict with file contents
+                           (default False). Set True when you need to read
+                           file bodies, not just match positions.
 
         Returns:
-            Dict with 'matches' (grouped by file) and 'files' (full contents).
+            Dict with:
+              'matches': dict[filepath, list[{file, line_number, line}]]
+              'files':   dict[filepath, content|excerpts]  (empty when include_files=False)
+              'summary': str
         """
         results = grep(pattern, path)
         if not results:
@@ -131,26 +139,28 @@ def make_helpers(base_path: str) -> tuple[dict, callable]:
 
         file_paths = list(grouped.keys())[:max_files]
         file_contents = {}
-        for fp in file_paths:
-            try:
-                content = read_file(fp)
-                if context_lines > 0:
-                    content_lines = content.splitlines()
-                    relevant = set()
-                    for m in grouped[fp]:
-                        line_idx = m["line_number"] - 1
-                        start = max(0, line_idx - context_lines)
-                        end = min(len(content_lines), line_idx + context_lines + 1)
-                        for i in range(start, end):
-                            relevant.add(i)
-                    excerpts = []
-                    for i in sorted(relevant):
-                        excerpts.append(f"L{i+1}: {content_lines[i]}")
-                    file_contents[fp] = "\n".join(excerpts)
-                else:
-                    file_contents[fp] = content
-            except (OSError, PermissionError) as e:
-                file_contents[fp] = f"[error: {e}]"
+
+        if include_files or context_lines > 0:
+            for fp in file_paths:
+                try:
+                    content = read_file(fp)
+                    if context_lines > 0:
+                        content_lines = content.splitlines()
+                        relevant = set()
+                        for m in grouped[fp]:
+                            line_idx = m["line_number"] - 1
+                            start = max(0, line_idx - context_lines)
+                            end = min(len(content_lines), line_idx + context_lines + 1)
+                            for i in range(start, end):
+                                relevant.add(i)
+                        excerpts = []
+                        for i in sorted(relevant):
+                            excerpts.append(f"L{i+1}: {content_lines[i]}")
+                        file_contents[fp] = "\n".join(excerpts)
+                    else:
+                        file_contents[fp] = content
+                except (OSError, PermissionError) as e:
+                    file_contents[fp] = f"[error: {e}]"
 
         truncated = len(grouped) - len(file_paths) if len(grouped) > max_files else 0
         summary = f"{len(results)} matches in {len(grouped)} files"
