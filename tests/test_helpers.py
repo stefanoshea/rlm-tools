@@ -161,3 +161,42 @@ def test_grep_read_max_files():
         result = helpers["grep_read"]("def", max_files=2)
         assert len(result["files"]) == 2
         assert "more" in result["summary"]
+
+
+def test_find_files():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        os.makedirs(os.path.join(tmpdir, "Documents", "ЗаявкаНаРасходование", "Forms"))
+        test_file = os.path.join(tmpdir, "Documents", "ЗаявкаНаРасходование", "Forms", "Module.bsl")
+        open(test_file, "w").close()
+        open(os.path.join(tmpdir, "other.txt"), "w").close()
+
+        helpers, _ = make_helpers(tmpdir)
+        matches = helpers["find_files"]("ЗаявкаНаРасходование")
+        assert len(matches) == 1
+        assert "ЗаявкаНаРасходование" in matches[0]
+        assert "/" in matches[0]  # forward slashes
+
+
+def test_find_files_case_insensitive():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        os.makedirs(os.path.join(tmpdir, "src"))
+        open(os.path.join(tmpdir, "src", "MyClass.py"), "w").close()
+
+        helpers, _ = make_helpers(tmpdir)
+        matches_sensitive = helpers["find_files"]("myclass")
+        assert len(matches_sensitive) == 0
+
+        matches_insensitive = helpers["find_files"]("myclass", case_sensitive=False)
+        assert len(matches_insensitive) == 1
+
+
+def test_glob_files_returns_forward_slashes():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        os.makedirs(os.path.join(tmpdir, "nested", "dir"))
+        open(os.path.join(tmpdir, "nested", "dir", "file.py"), "w").close()
+
+        helpers, _ = make_helpers(tmpdir)
+        matches = helpers["glob_files"]("**/*.py")
+        assert len(matches) == 1
+        assert "\\" not in matches[0]
+        assert "/" in matches[0]

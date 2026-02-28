@@ -11,6 +11,7 @@ from pydantic import Field
 from rlm_tools.session import SessionManager
 from rlm_tools.sandbox import Sandbox
 from rlm_tools.llm_bridge import make_llm_query, make_llm_query_batched
+from rlm_tools.cache import DirectoryCache
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,13 +29,16 @@ _sandboxes: dict[str, Sandbox] = {}
 from rlm_tools.helpers import _SKIP_DIRS, _BINARY_EXTENSIONS
 
 
-def _scan_metadata(path: str) -> dict:
+def _do_scan_metadata(path: str) -> tuple[dict, list[str]]:
+    """Полное сканирование директории. Возвращает (metadata, file_index)."""
     extensions: dict[str, int] = {}
     total_files = 0
     total_lines = 0
     sampled_lines = 0
     sampled_files = 0
     sample_budget = 500
+    file_index: list[str] = []
+    base = pathlib.Path(path)
 
     for dirpath, dirnames, filenames in os.walk(path):
         dirnames[:] = [
@@ -49,10 +53,16 @@ def _scan_metadata(path: str) -> dict:
             extensions[ext] = extensions.get(ext, 0) + 1
             total_files += 1
 
+            fpath = os.path.join(dirpath, fname)
+            try:
+                rel = str(pathlib.Path(fpath).relative_to(base))
+            except ValueError:
+                rel = fpath
+            file_index.append(rel)
+
             if ext not in _BINARY_EXTENSIONS:
                 try:
-                    fpath = os.path.join(dirpath, fname)
-                    with open(fpath, errors="replace") as f:
+                    with open(fpath, encoding="utf-8-sig", errors="replace") as f:
                         file_line_count = sum(1 for _ in f)
                     total_lines += file_line_count
 
@@ -62,13 +72,35 @@ def _scan_metadata(path: str) -> dict:
                 except OSError:
                     pass
 
-    return {
+    metadata = {
         "total_files": total_files,
         "total_lines": total_lines,
         "sampled_lines": sampled_lines,
         "sampled_files": sampled_files,
         "file_types": dict(sorted(extensions.items(), key=lambda x: -x[1])[:10]),
     }
+    return metadata, file_index
+
+
+def _scan_metadata(path: str, force_rescan: bool = False) -> tuple[dict, list[str] | None]:
+    """Вернуть метаданные и индекс файлов, используя кэш если возможно."""
+    cache = DirectoryCache(path)
+
+    if not force_rescan:
+        cached_meta = cache.get_metadata()
+        cached_index = cache.get_file_index()
+        if cached_meta is not None and cached_index is not None:
+            logger.info(f"Loaded metadata and file index from cache for {path}")
+            return cached_meta, cached_index
+
+    logger.info(f"Scanning directory (force_rescan={force_rescan}): {path}")
+    metadata, file_index = _do_scan_metadata(path)
+
+    cache.save_metadata(metadata)
+    cache.save_file_index(file_index)
+    logger.info(f"Saved metadata and file index to cache for {path}")
+
+    return metadata, file_index
 
 
 def _cleanup_expired_resources() -> None:
@@ -125,6 +157,7 @@ def _rlm_start(
     execution_timeout_seconds: int = 30,
     include_guidance: bool = False,
     include_metadata: bool = True,
+    force_rescan: bool = False,
 ) -> str:
     _cleanup_expired_resources()
 
@@ -147,12 +180,17 @@ def _rlm_start(
     if not session:
         return json.dumps({"error": f"Failed to create session for path: {path}"})
 
-    metadata = _scan_metadata(resolved) if include_metadata else {}
+    file_index: list[str] | None = None
+    if include_metadata:
+        metadata, file_index = _scan_metadata(resolved, force_rescan=force_rescan)
+    else:
+        metadata = {}
 
     sandbox = Sandbox(
         base_path=resolved,
         max_output_chars=max_output_chars,
         execution_timeout_seconds=execution_timeout_seconds,
+        file_index=file_index,
     )
     has_llm_tools = _install_session_llm_tools(session, sandbox)
 
@@ -163,8 +201,9 @@ def _rlm_start(
         "read_files(paths) -> dict[path, content]",
         "grep(pattern, path='.')",
         "grep_summary(pattern, path='.') -> compact grouped string",
-        "grep_read(pattern, path='.', max_files=10, context_lines=0) -> {matches, files, summary}",
-        "glob_files(pattern)",
+        "grep_read(pattern, path='.', max_files=10, context_lines=0, include_files=False) -> {matches: dict[filepath, list[{file,line_number,line}]], files: dict, summary: str}",
+        "glob_files(pattern) -> list[str] — glob pattern matching (use **/ for recursive)",
+        "find_files(substring, case_sensitive=True) -> list[str] — find files by substring in path (preferred for object names)",
         "tree(path='.', max_depth=3)",
     ]
     if has_llm_tools:
@@ -284,8 +323,9 @@ async def rlm_start(
     execution_timeout_seconds: Annotated[int, Field(description="Per-rlm_execute timeout in seconds", ge=1, le=300)] = 30,
     include_guidance: Annotated[bool, Field(description="Include strategy/example guidance text in the response (larger payload)")] = False,
     include_metadata: Annotated[bool, Field(description="Scan directory and include file counts/types in response (set false for faster startup)")] = True,
+    force_rescan: Annotated[bool, Field(description="Force full directory rescan, ignoring cached file index and metadata")] = False,
 ) -> str:
-    """Start an RLM exploration session. Returns session_id, metadata, limits, and available functions. Set include_guidance=true to include strategy/example coaching text."""
+    """Start an RLM exploration session. Returns session_id, metadata, limits, and available functions. Metadata and file index are cached in .rlm_cache/ for fast repeated starts. Set force_rescan=true to rebuild the cache."""
     return _rlm_start(
         path=path,
         query=query,
@@ -295,6 +335,7 @@ async def rlm_start(
         execution_timeout_seconds=execution_timeout_seconds,
         include_guidance=include_guidance,
         include_metadata=include_metadata,
+        force_rescan=force_rescan,
     )
 
 
