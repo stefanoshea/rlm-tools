@@ -1,7 +1,10 @@
 import uuid
 import time
+import logging
 import threading
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -24,6 +27,7 @@ class SessionManager:
         self._sessions: dict[str, Session] = {}
         self._max_sessions = max_sessions
         self._timeout_seconds = timeout_minutes * 60
+        self._timeout_minutes = timeout_minutes
         self._lock = threading.Lock()
 
     def create(
@@ -74,5 +78,11 @@ class SessionManager:
             if now - s.last_used > self._timeout_seconds
         ]
         for sid in expired:
-            self._sessions.pop(sid, None)
+            session = self._sessions.pop(sid, None)
+            if session:
+                idle_minutes = (now - session.last_used) / 60
+                logger.info(
+                    f"Session '{sid}' expired after {idle_minutes:.1f} min idle "
+                    f"(timeout={self._timeout_minutes} min, path={session.path})"
+                )
         return expired

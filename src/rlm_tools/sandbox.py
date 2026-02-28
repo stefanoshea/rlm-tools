@@ -3,7 +3,9 @@ import contextlib
 import builtins
 import pathlib
 import signal
+import sys
 import threading
+import ctypes
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -38,6 +40,23 @@ def _make_restricted_import(allowed: frozenset[str]):
         return original_import(name, *args, **kwargs)
 
     return restricted_import
+
+
+class _TimeoutException(Exception):
+    pass
+
+
+def _async_raise(thread_id: int, exception_class: type) -> None:
+    """Raise an exception in a thread (Windows-compatible timeout mechanism)."""
+    result = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        ctypes.c_ulong(thread_id),
+        ctypes.py_object(exception_class),
+    )
+    if result == 0:
+        raise ValueError(f"Invalid thread id: {thread_id}")
+    elif result > 1:
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(thread_id), None)
+        raise SystemError("PyThreadState_SetAsyncExc failed")
 
 
 class Sandbox:
@@ -75,7 +94,6 @@ class Sandbox:
             if isinstance(file, int):
                 raise PermissionError("File descriptor access is not allowed in sandbox")
 
-            # Keep read access scoped to the sandbox root.
             safe_path = self._resolve_safe(str(pathlib.Path(file)))
             return original_open(safe_path, mode, *args, **kwargs)
 
@@ -86,16 +104,15 @@ class Sandbox:
         helpers, self._resolve_safe = make_helpers(self._base_path, file_index=self._file_index)
         self._namespace.update(helpers)
 
-    @contextmanager
-    def _execution_timeout(self):
-        if (
-            self._execution_timeout_seconds <= 0
-            or threading.current_thread() is not threading.main_thread()
-            or not hasattr(signal, "SIGALRM")
-        ):
-            yield
-            return
+    def _can_use_sigalrm(self) -> bool:
+        return (
+            threading.current_thread() is threading.main_thread()
+            and hasattr(signal, "SIGALRM")
+        )
 
+    @contextmanager
+    def _execution_timeout_sigalrm(self):
+        """Unix-based timeout using SIGALRM."""
         def _raise_timeout(_signum, _frame):
             raise TimeoutError(
                 f"Execution timed out after {self._execution_timeout_seconds} seconds"
@@ -110,18 +127,75 @@ class Sandbox:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous_handler)
 
-    def execute(self, code: str) -> ExecutionResult:
+    def _execute_with_thread_timeout(self, code: str) -> tuple[str, str | None]:
+        """Windows-compatible timeout using threading and async exception."""
         stdout_capture = io.StringIO()
-        error = None
+        result_holder: dict = {"error": None}
+        target_thread_id: list[int] = []
 
-        try:
-            with contextlib.redirect_stdout(stdout_capture):
-                with self._execution_timeout():
+        def target():
+            target_thread_id.append(threading.current_thread().ident)
+            try:
+                with contextlib.redirect_stdout(stdout_capture):
                     exec(code, self._namespace)
-        except Exception as e:
-            error = f"{type(e).__name__}: {e}"
+            except _TimeoutException:
+                result_holder["error"] = (
+                    f"TimeoutError: Execution timed out after "
+                    f"{self._execution_timeout_seconds} seconds"
+                )
+            except Exception as e:
+                result_holder["error"] = f"{type(e).__name__}: {e}"
 
-        stdout = stdout_capture.getvalue()
+        thread = threading.Thread(target=target)
+        thread.start()
+        thread.join(timeout=self._execution_timeout_seconds)
+
+        if thread.is_alive():
+            if target_thread_id:
+                try:
+                    _async_raise(target_thread_id[0], _TimeoutException)
+                except (ValueError, SystemError):
+                    pass
+            thread.join(timeout=1.0)
+            if result_holder["error"] is None:
+                result_holder["error"] = (
+                    f"TimeoutError: Execution timed out after "
+                    f"{self._execution_timeout_seconds} seconds"
+                )
+
+        return stdout_capture.getvalue(), result_holder["error"]
+
+    @contextmanager
+    def _execution_timeout(self):
+        if self._execution_timeout_seconds <= 0:
+            yield
+            return
+
+        if self._can_use_sigalrm():
+            with self._execution_timeout_sigalrm():
+                yield
+        else:
+            yield
+
+    def execute(self, code: str) -> ExecutionResult:
+        use_thread_timeout = (
+            self._execution_timeout_seconds > 0
+            and not self._can_use_sigalrm()
+        )
+
+        if use_thread_timeout:
+            stdout, error = self._execute_with_thread_timeout(code)
+        else:
+            stdout_capture = io.StringIO()
+            error = None
+            try:
+                with contextlib.redirect_stdout(stdout_capture):
+                    with self._execution_timeout():
+                        exec(code, self._namespace)
+            except Exception as e:
+                error = f"{type(e).__name__}: {e}"
+            stdout = stdout_capture.getvalue()
+
         if len(stdout) > self._max_output_chars:
             stdout = stdout[:self._max_output_chars] + "\n... [output truncated]"
 

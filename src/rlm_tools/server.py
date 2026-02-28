@@ -202,7 +202,8 @@ def _rlm_start(
         "grep(pattern, path='.')",
         "grep_summary(pattern, path='.') -> compact grouped string",
         "grep_read(pattern, path='.', max_files=10, context_lines=0, include_files=False) -> {matches: dict[filepath, list[{file,line_number,line}]], files: dict, summary: str}",
-        "glob_files(pattern)",
+        "glob_files(pattern) -> list[str] — glob pattern matching (use **/ for recursive)",
+        "find_files(substring, case_sensitive=True) -> list[str] — find files by substring in path (preferred for object names)",
         "tree(path='.', max_depth=3)",
     ]
     if has_llm_tools:

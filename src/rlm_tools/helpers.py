@@ -205,7 +205,7 @@ def make_helpers(base_path: str, file_index: list[str] | None = None) -> tuple[d
                     or _fnmatch.fnmatch(rel_posix, pattern)
                     or (_name_pattern and _fnmatch.fnmatch(abs_path.name, _name_pattern))
                 ):
-                    safe_matches.append(str(rel))
+                    safe_matches.append(rel_posix)
             return safe_matches
 
         matches = list(base.glob(pattern))
@@ -217,10 +217,55 @@ def make_helpers(base_path: str, file_index: list[str] | None = None) -> tuple[d
             if any(part in _SKIP_DIRS or part.startswith(".") for part in parts[:-1]):
                 continue
             try:
-                safe_matches.append(str(match.resolve().relative_to(base)))
+                rel = match.resolve().relative_to(base)
+                safe_matches.append(rel.as_posix())
             except ValueError:
                 continue
         return safe_matches
+
+    def find_files(substring: str, case_sensitive: bool = True) -> list[str]:
+        """Find files by substring match in path.
+
+        Unlike glob_files which uses glob patterns, this function searches
+        for a literal substring anywhere in the file path.
+
+        Args:
+            substring: Text to search for in file paths.
+            case_sensitive: Whether to match case (default True).
+
+        Returns:
+            List of matching file paths (forward slashes, relative to base).
+        """
+        result: list[str] = []
+        search_term = substring if case_sensitive else substring.lower()
+
+        if _index_paths is not None:
+            for abs_path in _index_paths:
+                if not abs_path.is_file():
+                    continue
+                try:
+                    rel = abs_path.relative_to(base)
+                except ValueError:
+                    continue
+                parts = rel.parts
+                if any(part in _SKIP_DIRS or part.startswith(".") for part in parts[:-1]):
+                    continue
+                rel_posix = rel.as_posix()
+                check_path = rel_posix if case_sensitive else rel_posix.lower()
+                if search_term in check_path:
+                    result.append(rel_posix)
+        else:
+            for file_path in _walk_files(base):
+                try:
+                    rel = file_path.relative_to(base)
+                except ValueError:
+                    continue
+                rel_posix = rel.as_posix()
+                check_path = rel_posix if case_sensitive else rel_posix.lower()
+                if search_term in check_path:
+                    result.append(rel_posix)
+
+        return result
 
     def tree(path: str = ".", max_depth: int = 3) -> str:
         target = _resolve_safe(path)
@@ -252,5 +297,6 @@ def make_helpers(base_path: str, file_index: list[str] | None = None) -> tuple[d
         "grep_summary": grep_summary,
         "grep_read": grep_read,
         "glob_files": glob_files,
+        "find_files": find_files,
         "tree": tree,
     }, _resolve_safe
