@@ -46,10 +46,12 @@ class Sandbox:
         base_path: str,
         max_output_chars: int = 15_000,
         execution_timeout_seconds: int = 30,
+        file_index: list[str] | None = None,
     ):
         self._base_path = base_path
         self._max_output_chars = max_output_chars
         self._execution_timeout_seconds = execution_timeout_seconds
+        self._file_index = file_index
         self._namespace: dict = {}
         self._resolve_safe = None
         self._setup_namespace()
@@ -81,7 +83,7 @@ class Sandbox:
 
         self._namespace["__builtins__"] = safe_builtins
 
-        helpers, self._resolve_safe = make_helpers(self._base_path)
+        helpers, self._resolve_safe = make_helpers(self._base_path, file_index=self._file_index)
         self._namespace.update(helpers)
 
     @contextmanager

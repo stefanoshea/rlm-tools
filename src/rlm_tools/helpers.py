@@ -28,9 +28,13 @@ def _walk_files(root: pathlib.Path):
             yield pathlib.Path(dirpath) / fname
 
 
-def make_helpers(base_path: str) -> tuple[dict, callable]:
+def make_helpers(base_path: str, file_index: list[str] | None = None) -> tuple[dict, callable]:
     base = pathlib.Path(base_path).resolve()
     _file_cache: dict[str, str] = {}
+    # Предварительно вычисленный набор путей из индекса для быстрой glob-фильтрации
+    _index_paths: frozenset[pathlib.Path] | None = (
+        frozenset(base / f for f in file_index) if file_index is not None else None
+    )
 
     def _resolve_safe(path: str) -> pathlib.Path:
         resolved = (base / path).resolve()
@@ -66,6 +70,9 @@ def make_helpers(base_path: str) -> tuple[dict, callable]:
 
         if target.is_file():
             search_paths = [target]
+        elif _index_paths is not None and target == base:
+            # Используем кэшированный индекс для поиска по корневой директории
+            search_paths = (p for p in _index_paths if p.is_file())
         else:
             search_paths = _walk_files(target)
 
@@ -174,8 +181,35 @@ def make_helpers(base_path: str) -> tuple[dict, callable]:
         }
 
     def glob_files(pattern: str) -> list[str]:
+        if _index_paths is not None:
+            import fnmatch as _fnmatch
+            # Суффикс паттерна для проверки файлов в корне директории:
+            # Path.match('**/*.py') == False для example.py (файл в корне),
+            # поэтому дополнительно проверяем имя файла по последнему
+            # компоненту паттерна, если паттерн содержит **.
+            _name_pattern = pattern.split("/")[-1] if "**" in pattern else ""
+            safe_matches: list[str] = []
+            for abs_path in _index_paths:
+                if not abs_path.is_file():
+                    continue
+                try:
+                    rel = abs_path.relative_to(base)
+                except ValueError:
+                    continue
+                parts = rel.parts
+                if any(part in _SKIP_DIRS or part.startswith(".") for part in parts[:-1]):
+                    continue
+                rel_posix = rel.as_posix()
+                if (
+                    rel.match(pattern)
+                    or _fnmatch.fnmatch(rel_posix, pattern)
+                    or (_name_pattern and _fnmatch.fnmatch(abs_path.name, _name_pattern))
+                ):
+                    safe_matches.append(str(rel))
+            return safe_matches
+
         matches = list(base.glob(pattern))
-        safe_matches: list[str] = []
+        safe_matches = []
         for match in matches:
             if not match.is_file():
                 continue
