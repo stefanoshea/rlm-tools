@@ -77,11 +77,13 @@ def render_policy_block() -> str:
 
 def upsert_policy_block(existing_text: str) -> str:
     block = render_policy_block()
-    start_idx = existing_text.find(POLICY_START)
-    end_idx = existing_text.find(POLICY_END)
-
-    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-        end_idx = end_idx + len(POLICY_END)
+    if POLICY_START in existing_text or POLICY_END in existing_text:
+        if existing_text.count(POLICY_START) != 1 or existing_text.count(POLICY_END) != 1:
+            raise ValueError("Expected exactly one pair of rlm-tools policy markers")
+        start_idx = existing_text.index(POLICY_START)
+        end_idx = existing_text.index(POLICY_END) + len(POLICY_END)
+        if end_idx <= start_idx:
+            raise ValueError("The rlm-tools policy markers are out of order")
         replacement = block.rstrip("\n")
         return existing_text[:start_idx] + replacement + existing_text[end_idx:]
 
@@ -107,13 +109,12 @@ def main() -> None:
     parser.add_argument(
         "--client",
         choices=["auto", "claude", "codex", "json"],
-        default="auto",
         help="Target client to configure (default: auto-detect claude/codex).",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print install commands without executing them.",
+        help="Preview install commands and policy changes.",
     )
     parser.add_argument(
         "--print-policy",
@@ -133,9 +134,11 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    any_success = False
+    install_failed = False
     install_targets: list[str] = []
-    if args.client == "auto":
+    print_only = (args.print_policy or args.print_json) and not args.write_policy
+    client_mode = args.client or ("print" if print_only else "auto")
+    if client_mode == "auto":
         install_targets = detect_supported_clients()
     elif args.client in {"claude", "codex"}:
         install_targets = [args.client]
@@ -149,17 +152,22 @@ def main() -> None:
         ok, output = run_install(client, dry_run=args.dry_run)
         status = "ok" if ok else "error"
         print(f"[{status}] {client}: {output}")
-        any_success = any_success or ok
+        install_failed = install_failed or not ok
 
-    if args.client == "auto" and not install_targets:
+    if client_mode == "auto" and not install_targets:
         print("No supported client CLI found (expected `claude` and/or `codex` on PATH).")
         print("Use --print-json to configure another MCP client.")
 
     if args.write_policy:
         policy_path = Path(args.write_policy)
-        write_policy(policy_path)
-        print(f"Policy block written to {policy_path}")
-        any_success = True
+        if args.dry_run:
+            print(f"[dry-run] Would write policy block to {policy_path}")
+        else:
+            try:
+                write_policy(policy_path)
+            except (OSError, ValueError) as exc:
+                parser.exit(1, f"Could not update {policy_path}: {exc}\n")
+            print(f"Policy block written to {policy_path}")
     elif args.print_policy:
         print("Recommended policy block:")
         print(render_policy_block())
@@ -174,6 +182,6 @@ def main() -> None:
         print("Nothing to do. Try `rlm-tools-setup --print-policy --print-json`.", file=sys.stderr)
         sys.exit(1)
 
-    if install_targets and not any_success and not args.write_policy:
+    if install_failed:
         sys.exit(1)
 

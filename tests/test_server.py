@@ -1,6 +1,12 @@
+import asyncio
 import json
 import os
 import tempfile
+import threading
+from unittest.mock import MagicMock, patch
+
+import pytest
+
 from rlm_tools.server import _rlm_start, _rlm_execute, _rlm_end
 
 
@@ -46,6 +52,120 @@ def test_invalid_directory():
     assert "error" in data
 
 
+def test_server_shutdown_releases_open_sessions(tmp_path, monkeypatch):
+    from rlm_tools import server
+    from rlm_tools.session import SessionManager
+
+    monkeypatch.setattr(server, "session_manager", SessionManager())
+    monkeypatch.setattr(server, "_sandboxes", {})
+    monkeypatch.setattr(server.mcp, "run", lambda transport: None)
+    started = json.loads(server._rlm_start(str(tmp_path), "open session"))
+    session_id = started["session_id"]
+    worker = server._sandboxes[session_id]._process
+    server.main()
+    assert not worker.is_alive()
+    assert server.session_manager.get(session_id) is None
+    assert not server._sandboxes
+
+
+@pytest.mark.asyncio
+async def test_mcp_sessions_progress_independently_and_serialize_calls(tmp_path, monkeypatch):
+    from rlm_tools import server
+
+    limiter = server.to_thread.current_default_thread_limiter()
+    monkeypatch.setattr(limiter, "total_tokens", 2)
+    first_id = json.loads(await server.rlm_start(str(tmp_path), "first", max_execute_calls=2))["session_id"]
+    other_id = json.loads(await server.rlm_start(str(tmp_path), "other"))["session_id"]
+    entered = threading.Event()
+    resume = threading.Event()
+
+    def pause():
+        entered.set()
+        return resume.wait(timeout=5)
+
+    server._sandboxes[first_id].register_tool("pause", pause)
+    first = asyncio.create_task(server.rlm_execute(first_id, "pause()\nx = 41", "usage"))
+    queued = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 3)
+        queued = asyncio.create_task(server.rlm_execute(first_id, "print(x + 1)", "usage"))
+        other = await asyncio.wait_for(server.rlm_execute(other_id, "print('other session')"), timeout=3)
+        assert json.loads(other)["stdout"] == "other session\n"
+        assert not first.done()
+        assert not queued.done()
+
+        resume.set()
+        first_result, queued_result = map(json.loads, await asyncio.gather(first, queued))
+        assert first_result["usage"]["execute_calls_used"] == 1
+        assert queued_result["usage"]["execute_calls_used"] == 2
+        assert queued_result["stdout"] == "42\n"
+        over_budget = json.loads(await server.rlm_execute(first_id, "print(x)"))
+        assert "Execution call limit exceeded" in over_budget["error"]
+    finally:
+        resume.set()
+        tasks = [first] if queued is None else [first, queued]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(server.rlm_end(first_id), server.rlm_end(other_id))
+
+
+@pytest.mark.asyncio
+async def test_mcp_start_preserves_positional_timeout_and_metadata(tmp_path):
+    from rlm_tools import server
+
+    result = json.loads(await server.rlm_start(str(tmp_path), "test", 15_000, 50, 50, 1, True, True))
+    try:
+        assert result["limits"]["execution_timeout_seconds"] == 1
+        assert "strategy" in result
+        assert result["metadata"]["total_files"] == 0
+    finally:
+        await server.rlm_end(result["session_id"])
+
+
+def test_worker_start_failure_releases_session_slot(tmp_path, monkeypatch):
+    from rlm_tools import server
+    from rlm_tools.session import SessionManager
+
+    monkeypatch.setattr(server, "session_manager", SessionManager(max_sessions=1))
+    with patch("rlm_tools.server.Sandbox", side_effect=RuntimeError("worker failed")):
+        failed = json.loads(server._rlm_start(str(tmp_path), "test"))
+    assert "worker failed" in failed["error"]
+
+    started = json.loads(server._rlm_start(str(tmp_path), "try again"))
+    server._rlm_end(started["session_id"])
+
+
+def test_flat_query_retries_respect_session_budget(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    client = MagicMock()
+    client.messages.create.side_effect = ConnectionError("provider unavailable")
+
+    with patch("rlm_tools.llm_bridge.get_client", return_value=client), \
+            patch("rlm_tools.llm_bridge.time.sleep"):
+        started = json.loads(_rlm_start(str(tmp_path), "test", max_llm_calls=1))
+        session_id = started["session_id"]
+        try:
+            result = json.loads(_rlm_execute(
+                session_id, "print(llm_query('question'))", detail_level="usage"
+            ))
+        finally:
+            _rlm_end(session_id)
+
+    assert "LLM call limit exceeded" in result["error"]
+    assert result["usage"]["llm_calls_used"] == 1
+    client.messages.create.assert_called_once()
+
+
+def test_tool_install_failure_closes_the_worker(tmp_path):
+    from rlm_tools import server
+
+    with patch.object(server, "Sandbox") as make_sandbox, \
+            patch.object(server, "_install_session_llm_tools", side_effect=RuntimeError("tool registration failed")):
+        failed = json.loads(server._rlm_start(str(tmp_path), "test"))
+
+    assert "tool registration failed" in failed["error"]
+    make_sandbox.return_value.close.assert_called_once()
+
+
 def test_metadata_includes_file_types():
     with tempfile.TemporaryDirectory() as tmpdir:
         open(os.path.join(tmpdir, "a.py"), "w").close()
@@ -54,10 +174,37 @@ def test_metadata_includes_file_types():
 
         result = _rlm_start(path=tmpdir, query="test")
         data = json.loads(result)
+        assert data["metadata"] == {}
+
+        _rlm_end(data["session_id"])
+
+
+def test_metadata_includes_file_types_when_enabled():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        open(os.path.join(tmpdir, "a.py"), "w").close()
+        open(os.path.join(tmpdir, "b.py"), "w").close()
+        open(os.path.join(tmpdir, "c.txt"), "w").close()
+
+        result = _rlm_start(path=tmpdir, query="test", include_metadata=True)
+        data = json.loads(result)
         assert data["metadata"]["total_files"] == 3
         assert ".py" in data["metadata"]["file_types"]
 
         _rlm_end(data["session_id"])
+
+
+def test_metadata_counts_regular_files_and_skips_binary_lines(tmp_path):
+    from rlm_tools.server import _scan_metadata
+
+    (tmp_path / "notes.txt").write_text("first\nsecond\n")
+    (tmp_path / "image.PNG").write_bytes(b"image\ndata\n")
+    (tmp_path / "missing.txt").symlink_to(tmp_path / "removed.txt")
+
+    metadata = _scan_metadata(str(tmp_path))
+
+    assert metadata["total_files"] == 2
+    assert metadata["total_lines"] == 2
+    assert metadata["file_types"] == {".txt": 1, ".PNG": 1}
 
 
 def test_read_file_in_sandbox():
@@ -155,6 +302,7 @@ def test_new_defaults():
         data = json.loads(result)
         assert data["limits"]["max_execute_calls"] == 50
         assert data["limits"]["execution_timeout_seconds"] == 30
+        assert data["limits"]["max_memory_bytes"] == 10_000_000
 
         _rlm_end(data["session_id"])
 
@@ -181,3 +329,116 @@ def test_full_detail_excludes_helper_functions_from_variables():
         assert "grep_read" not in result["variables"]
 
         _rlm_end(session_id)
+
+
+def test_usage_includes_memory_bytes():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "a.txt"), "w") as f:
+            f.write("hello")
+
+        start = json.loads(_rlm_start(path=tmpdir, query="memory usage"))
+        session_id = start["session_id"]
+        result = json.loads(
+            _rlm_execute(
+                session_id=session_id,
+                code="print(read_file('a.txt'))",
+                detail_level="usage",
+            )
+        )
+
+        assert result["usage"]["memory_bytes_used"] > 0
+        _rlm_end(session_id)
+
+
+def test_memory_limit_counts_worker_namespace_allocations():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        start = json.loads(
+            _rlm_start(
+                path=tmpdir,
+                query="memory limit",
+                max_memory_bytes=1024,
+            )
+        )
+        session_id = start["session_id"]
+        try:
+            result = json.loads(
+                _rlm_execute(
+                    session_id=session_id,
+                    code="blob = 'x' * 50_000\nprint(len(blob))",
+                    detail_level="usage",
+                )
+            )
+            assert result["error"] is not None
+            assert "memory" in result["error"].lower()
+            assert result["usage"]["memory_bytes_used"] > 1024
+        finally:
+            _rlm_end(session_id)
+
+
+def test_recursive_helpers_and_finalize():
+    # rlm_recurse wraps the recursive explorer; rlm_recurse_batched runs that
+    # explorer once per prompt via the real batched wrapper (left unpatched).
+    with tempfile.TemporaryDirectory() as tmpdir, \
+            patch("rlm_tools.server.make_llm_query") as make_query, \
+            patch("rlm_tools.server.make_recursive_query") as make_recursive:
+        os.environ["ANTHROPIC_API_KEY"] = "test-key"
+        make_query.return_value = lambda prompt, context="": f"flat:{prompt}:{context}"
+        make_recursive.return_value = lambda prompt, context="": f"answer:{prompt}:{context}"
+
+        start = json.loads(_rlm_start(path=tmpdir, query="recursive helpers"))
+        session_id = start["session_id"]
+        try:
+            result = json.loads(
+                _rlm_execute(
+                    session_id=session_id,
+                    code=(
+                        "snippet = 'class DashboardReducer: pass'\n"
+                        "response = rlm_recurse('What type is this?', snippet)\n"
+                        "batched = rlm_recurse_batched(['one', 'two'], snippet)\n"
+                        "rlm_finalize(response)\n"
+                        "print(response)\n"
+                        "print(','.join(batched))"
+                    ),
+                )
+            )
+            assert result["error"] is None
+            assert result["final"] == {"final": "answer:What type is this?:class DashboardReducer: pass"}
+            assert "answer:one:class DashboardReducer: pass" in result["stdout"]
+            assert "answer:two:class DashboardReducer: pass" in result["stdout"]
+        finally:
+            _rlm_end(session_id)
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+
+
+def test_the_gate_is_built_when_a_typesafe_key_is_set(tmp_path, monkeypatch):
+    """The gate is server-side only: it must never appear in the sandbox surface."""
+    import rlm_tools.server as server_module
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
+    monkeypatch.setattr(server_module, "make_scorer", lambda **kwargs: (lambda items, q: []))
+
+    gate = server_module._make_recurse_gate(session=None, reserve=lambda count: None)
+    assert gate is not None
+
+    response = json.loads(server_module._rlm_start(str(tmp_path), "query"))
+    functions = " ".join(response["available_functions"])
+    for removed in ("rank(", "keep(", "judge(", "classify("):
+        assert removed not in functions
+    server_module._rlm_end(response["session_id"])
+
+
+def test_no_gate_without_a_typesafe_key(tmp_path, monkeypatch):
+    import rlm_tools.server as server_module
+
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+
+    assert server_module._make_recurse_gate(session=None) is None
+
+
+def test_the_gate_can_be_switched_off(tmp_path, monkeypatch):
+    import rlm_tools.server as server_module
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
+    monkeypatch.setenv("RLM_RECURSE_GATE", "0")
+
+    assert server_module._make_recurse_gate(session=None) is None

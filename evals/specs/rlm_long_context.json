@@ -1,0 +1,158 @@
+{
+  "evals": [
+    {
+      "eval_id": "export_pipeline_gate",
+      "prompt": "In the codebase at `{target_path}`, trace the current export pipeline factory called by boot. Return a JSON object with exactly three strings: flag (the constant that gates the new builder), enabled_builder (the exact class name), and factory_file (repository-relative path).",
+      "notes": "The current factory is imported by boot. The legacy factory and design notes mention related names but do not determine the active branch.",
+      "assertions": [
+        {
+          "id": "complete_trace",
+          "kind": "json_equals",
+          "values": [
+            "{\"flag\": \"EXPORT_PIPELINE_V2\", \"enabled_builder\": \"DeltaExportBuilder\", \"factory_file\": \"app/export/pipeline.py\"}"
+          ]
+        }
+      ]
+    },
+    {
+      "eval_id": "shipment_retry_budget",
+      "prompt": "In the codebase at `{target_path}`, trace the retry budget that ShipmentOrchestrator reads. Return a JSON object with exactly five fields: workflow (the lookup key string), budget_constant (the constant used for that key), budget (integer), missing_workflow_budget (integer), and budget_file (the repository-relative file defining the constant).",
+      "notes": "Requires following the shipment workflow through the retry mapping and distinguishing its value from the fallback and invoice budget.",
+      "assertions": [
+        {
+          "id": "complete_trace",
+          "kind": "json_equals",
+          "values": [
+            "{\"workflow\": \"shipment\", \"budget_constant\": \"SHIPMENT_RETRY_BUDGET\", \"budget\": 5, \"missing_workflow_budget\": 2, \"budget_file\": \"app/retry_config.py\"}"
+          ]
+        }
+      ]
+    },
+    {
+      "eval_id": "reconciliation_success_metrics",
+      "prompt": "In the codebase at `{target_path}`, trace reconcile_accounts in app/reconcile/service.py. On the branch that emits metrics, which helper function does it call and which metric keys does that helper return? What does reconcile_accounts return on the nonpositive-row branch? Return a JSON object with exactly three fields: helper (function name), positive_row_metrics (array of metric-key strings in source order), and nonpositive_row_metrics (array of metric-key strings, with an empty array representing an empty tuple).",
+      "notes": "Scope is the two branches of reconcile_accounts. Reporting independently refers to SUCCESS_METRICS, while the legacy reconciler uses different keys.",
+      "assertions": [
+        {
+          "id": "complete_trace",
+          "kind": "json_equals",
+          "values": [
+            "{\"helper\": \"emit_success_metrics\", \"positive_row_metrics\": [\"reconcile.rows_updated\", \"reconcile.latency_ms\"], \"nonpositive_row_metrics\": []}"
+          ]
+        }
+      ]
+    },
+    {
+      "eval_id": "stripe_webhook_secret_chain",
+      "prompt": "In the codebase at `{target_path}`, trace where StripeGateway.verify_webhook gets the value passed as the HMAC secret. Return a JSON object with exactly three strings: config_key (dotted YAML key), python_constant (the constant referenced by the gateway), and settings_file (the repository-relative Python file that loads the key).",
+      "notes": "Requires tracing the Stripe gateway import through settings to the YAML key. PayPal has a similarly named method and Stripe separately defines the hash algorithm.",
+      "assertions": [
+        {
+          "id": "complete_trace",
+          "kind": "json_equals",
+          "values": [
+            "{\"config_key\": \"stripe.webhook_secret\", \"python_constant\": \"STRIPE_WEBHOOK_SECRET\", \"settings_file\": \"app/settings.py\"}"
+          ]
+        }
+      ]
+    },
+    {
+      "eval_id": "auth_token_algorithm",
+      "prompt": "In the codebase at `{target_path}`, trace the JWT signing algorithm used by encode_token in token_service.py with the checked-in settings, and find the fallback when its setting is absent. Return a JSON object with exactly five strings: configured_algorithm, missing_setting_algorithm, config_key (the dotted YAML key), config_file (repository-relative YAML path), and algorithm_constant_file (repository-relative Python path defining the imported constant).",
+      "notes": "The token service imports the algorithm from middleware.py. The generic settings constant has a different fallback, and legacy_auth.py is unused here.",
+      "assertions": [
+        {
+          "id": "complete_trace",
+          "kind": "json_equals",
+          "values": [
+            "{\"configured_algorithm\": \"HS512\", \"missing_setting_algorithm\": \"HS256\", \"config_key\": \"auth.token_algorithm\", \"config_file\": \"settings.yaml\", \"algorithm_constant_file\": \"app/auth/middleware.py\"}"
+          ]
+        }
+      ]
+    },
+    {
+      "eval_id": "refund_notification_channel",
+      "prompt": "In the codebase at `{target_path}`, follow a successful RefundService.process_refund call to the notification dispatcher. Return a JSON object with exactly three strings: event (the dispatch event type), sender_class (the class instantiated for the event), and unmapped_channel (the dispatcher channel name used for an event with no mapping).",
+      "notes": "The refund event resolves to the webhook registry entry. Slack is present in the package and the fallback channel is email.",
+      "assertions": [
+        {
+          "id": "complete_trace",
+          "kind": "json_equals",
+          "values": [
+            "{\"event\": \"refund_issued\", \"sender_class\": \"WebhookChannel\", \"unmapped_channel\": \"email\"}"
+          ]
+        }
+      ]
+    },
+    {
+      "eval_id": "product_cache_ttl",
+      "prompt": "In the codebase at `{target_path}`, trace the TTL used when ProductRepository.get_by_id writes a cache entry after a miss and successful database lookup. Return a JSON object with exactly four fields: ttl_seconds (integer), ttl_constant (constant name), ttl_file (repository-relative defining file), and default_backend (the class name used when no cache is supplied).",
+      "notes": "The repository imports the product TTL from the registry. The Memcache module defines a different constant with the same name.",
+      "assertions": [
+        {
+          "id": "complete_trace",
+          "kind": "json_equals",
+          "values": [
+            "{\"ttl_seconds\": 300, \"ttl_constant\": \"PRODUCT_CACHE_TTL\", \"ttl_file\": \"app/cache/registry.py\", \"default_backend\": \"RedisBackend\"}"
+          ]
+        }
+      ]
+    },
+    {
+      "eval_id": "order_terminal_states",
+      "prompt": "In the codebase at `{target_path}`, identify the complete terminal order states, the file that enforces terminal status before finalizing a ledger entry, and the metrics emitted after a successful refund transition. Return a JSON object with exactly three fields: terminal_states (array of strings in alphabetical order), ledger_file (repository-relative path), and refund_metrics (array of metric-key strings in source order).",
+      "notes": "Requires separating terminal states from allowed transitions or invalid states, then following the ledger guard and refund instrumentation.",
+      "assertions": [
+        {
+          "id": "complete_trace",
+          "kind": "json_equals",
+          "values": [
+            "{\"terminal_states\": [\"cancelled\", \"delivered\", \"refunded\"], \"ledger_file\": \"app/reconcile/ledger.py\", \"refund_metrics\": [\"refund.amount\", \"refund.count\"]}"
+          ]
+        }
+      ]
+    },
+    {
+      "eval_id": "notification_dispatch_routes",
+      "prompt": "In the codebase at `{target_path}`, trace the module-level notification dispatcher's checked-in configuration and channel registry. Give every explicitly configured event and the class that sends it, the sender class for an unmapped event, and all channel classes defined in the channels package that the dispatcher never registers. Return a JSON object with exactly these fields: event_channels (object mapping event names to class names), default_channel (class name), unregistered_channel_classes (array of class names, alphabetically sorted), dispatcher_file and config_file (repository-relative paths).",
+      "notes": "Requires resolving the YAML through settings.py, joining its mapping to the lazy registry and enumerating unregistered implementations from the channels package.",
+      "assertions": [
+        {
+          "id": "complete_trace",
+          "kind": "json_equals",
+          "values": [
+            "{\"event_channels\": {\"order_confirmed\": \"EmailChannel\", \"order_shipped\": \"SmsChannel\", \"refund_issued\": \"WebhookChannel\"}, \"default_channel\": \"EmailChannel\", \"unregistered_channel_classes\": [\"SlackChannel\"], \"dispatcher_file\": \"app/notifications/dispatcher.py\", \"config_file\": \"settings.yaml\"}"
+          ]
+        }
+      ]
+    },
+    {
+      "eval_id": "middleware_active_stack",
+      "prompt": "In the codebase at `{target_path}`, inspect what build_middleware_chain actually instantiates when called with a plain application. Which classes wrap the app, which declared entries are skipped, and what path prefixes does the instantiated authentication middleware exclude by default? Return a JSON object with exactly these fields: outermost_to_innermost (array of instantiated class names, in wrapping order), skipped_in_declared_order (array of skipped names, in declared order), default_excluded_prefixes (array of path strings in source order), chain_file and auth_file (repository-relative paths).",
+      "notes": "Declared middleware order is a decoy for actual composition. The active class and defaults must be followed through the registry and import.",
+      "assertions": [
+        {
+          "id": "complete_trace",
+          "kind": "json_equals",
+          "values": [
+            "{\"outermost_to_innermost\": [\"AuthMiddleware\"], \"skipped_in_declared_order\": [\"RequestIdMiddleware\", \"LoggingMiddleware\", \"RateLimitMiddleware\", \"CorsMiddleware\"], \"default_excluded_prefixes\": [\"/health\", \"/readyz\"], \"chain_file\": \"app/api/middleware_chain.py\", \"auth_file\": \"app/auth/middleware.py\"}"
+          ]
+        }
+      ]
+    },
+    {
+      "eval_id": "bootstrap_export_outcomes",
+      "prompt": "In the codebase at `{target_path}`, start at app/bootstrap.py's boot function and trace its export call. Give the factory and builder definition files, the controlling feature flag constant and its checked-in boolean default, and the selected builder plus its run() return value for each branch. Can this factory ever select DryRunExportBuilder? Return a JSON object with exactly these fields: factory_file and builders_file (repository-relative paths), flag (constant name), checked_in_default (boolean), when_enabled and when_disabled (objects each containing builder and run_result strings), and dry_run_reachable (boolean).",
+      "notes": "Requires following the live factory import, resolving both selection branches and their run methods, and ruling out the dry-run builder despite the presence of a dry-run flag and builder.",
+      "assertions": [
+        {
+          "id": "complete_trace",
+          "kind": "json_equals",
+          "values": [
+            "{\"factory_file\": \"app/export/pipeline.py\", \"builders_file\": \"app/export/steps.py\", \"flag\": \"EXPORT_PIPELINE_V2\", \"checked_in_default\": true, \"when_enabled\": {\"builder\": \"DeltaExportBuilder\", \"run_result\": \"delta\"}, \"when_disabled\": {\"builder\": \"LegacyExportBuilder\", \"run_result\": \"legacy\"}, \"dry_run_reachable\": false}"
+          ]
+        }
+      ]
+    }
+  ]
+}

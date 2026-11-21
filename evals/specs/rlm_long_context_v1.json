@@ -1,0 +1,85 @@
+{
+  "evals": [
+    {
+      "eval_id": "export_pipeline_gate",
+      "prompt": "In the codebase at `{target_path}`, identify the feature flag that gates the export pipeline and name the builder class enabled by that flag. Include the file where you found it. Note: there is a legacy_pipeline.py — make sure you identify the CURRENT pipeline, not the deprecated one.",
+      "notes": "Tests whether the model can trace a feature gate through multiple modules instead of stopping at the first matching file. legacy_pipeline.py and export_design.md are distractors.",
+      "assertions": [
+        {"id": "mentions_flag", "kind": "contains_all", "values": ["EXPORT_PIPELINE_V2"]},
+        {"id": "mentions_builder", "kind": "contains_all", "values": ["DeltaExportBuilder"]},
+        {"id": "mentions_pipeline_file", "kind": "contains_all", "values": ["app/export/pipeline.py"]}
+      ]
+    },
+    {
+      "eval_id": "shipment_retry_budget",
+      "prompt": "In the codebase at `{target_path}`, trace where ShipmentOrchestrator gets its retry budget. Name the constant, the file it comes from, and the fallback value if the budget key is missing.",
+      "notes": "Requires following an indirection from the orchestrator into config helpers and extracting the fallback behavior.",
+      "assertions": [
+        {"id": "mentions_constant", "kind": "contains_all", "values": ["SHIPMENT_RETRY_BUDGET"]},
+        {"id": "mentions_retry_file", "kind": "contains_all", "values": ["app/retry_config.py"]},
+        {"id": "mentions_fallback", "kind": "contains_all", "values": ["2"]}
+      ]
+    },
+    {
+      "eval_id": "reconciliation_success_metrics",
+      "prompt": "In the codebase at `{target_path}`, which metrics are emitted only on successful reconciliation? Name the function and both metric keys. Note: there is a legacy_reconciler.py and failure metrics — make sure you identify only the SUCCESS metrics from the current implementation.",
+      "notes": "Checks whether the model can separate success-only reporting from generic metric helpers amid distractor files (legacy_reconciler.py, FAILURE_METRICS).",
+      "assertions": [
+        {"id": "mentions_function", "kind": "contains_all", "values": ["emit_success_metrics"]},
+        {"id": "mentions_rows_metric", "kind": "contains_all", "values": ["reconcile.rows_updated"]},
+        {"id": "mentions_latency_metric", "kind": "contains_all", "values": ["reconcile.latency_ms"]}
+      ]
+    },
+    {
+      "eval_id": "stripe_webhook_secret_chain",
+      "prompt": "In the codebase at `{target_path}`, trace where StripeGateway.verify_webhook gets the webhook secret it uses for HMAC verification. Name the settings key in the YAML config file, the Python constant that holds it, and the file where it is first loaded into Python. Note: there is also a PayPal adapter — focus only on Stripe.",
+      "notes": "Requires tracing from stripe_adapter.py back through settings.py to settings.yaml. paypal_adapter.py has a similar verify_webhook with a different secret (distractor).",
+      "assertions": [
+        {"id": "mentions_yaml_key", "kind": "contains_all", "values": ["stripe.webhook_secret"]},
+        {"id": "mentions_constant", "kind": "contains_all", "values": ["STRIPE_WEBHOOK_SECRET"]},
+        {"id": "mentions_settings_file", "kind": "contains_all", "values": ["app/settings.py"]}
+      ]
+    },
+    {
+      "eval_id": "auth_token_algorithm",
+      "prompt": "In the codebase at `{target_path}`, what algorithm does encode_token in token_service.py use for JWT signing? Trace the value back to its ultimate source and name the fallback value if the setting is missing. Note: there is a legacy_auth.py — make sure you trace the CURRENT token service, not the deprecated one.",
+      "notes": "Must trace through token_service.py -> middleware.py -> settings.py -> settings.yaml. legacy_auth.py has TOKEN_ALGORITHM = 'HS256' (the fallback, not the actual value) and auth_migration.md is a distractor doc.",
+      "assertions": [
+        {"id": "mentions_algorithm", "kind": "contains_all", "values": ["HS512"]},
+        {"id": "mentions_fallback", "kind": "contains_all", "values": ["HS256"]},
+        {"id": "mentions_source_file", "kind": "contains_all", "values": ["app/auth/middleware.py", "settings.yaml"]}
+      ]
+    },
+    {
+      "eval_id": "refund_notification_channel",
+      "prompt": "In the codebase at `{target_path}`, when a refund is issued, which notification channel class actually sends the notification? Trace from the refund service through the notification dispatcher. Name the channel class, the event type string used in dispatch, and the default channel if an event type has no mapping.",
+      "notes": "Must trace from refund_service.py -> dispatcher.dispatch('refund_issued', ...) -> NOTIFICATION_CHANNEL_MAP -> 'webhook' -> WebhookChannel. slack_channel.py exists but is never routed to (distractor).",
+      "assertions": [
+        {"id": "mentions_channel_class", "kind": "contains_all", "values": ["WebhookChannel"]},
+        {"id": "mentions_event_type", "kind": "contains_all", "values": ["refund_issued"]},
+        {"id": "mentions_default", "kind": "contains_all", "values": ["email"]}
+      ]
+    },
+    {
+      "eval_id": "product_cache_ttl",
+      "prompt": "In the codebase at `{target_path}`, what TTL in seconds does ProductRepository use when caching product lookups? Name the constant, the file it is defined in, and the cache backend class used. Note: there are multiple cache backends — identify the one actually used by ProductRepository.",
+      "notes": "Must find ProductRepository in catalog/repository.py, trace TTL to cache/registry.py (PRODUCT_CACHE_TTL = 300). memcache_backend.py has PRODUCT_CACHE_TTL = 600 (distractor with wrong value).",
+      "assertions": [
+        {"id": "mentions_ttl_value", "kind": "contains_all", "values": ["300"]},
+        {"id": "mentions_constant", "kind": "contains_all", "values": ["PRODUCT_CACHE_TTL"]},
+        {"id": "mentions_backend", "kind": "contains_all", "values": ["RedisBackend"]},
+        {"id": "mentions_registry_file", "kind": "contains_all", "values": ["app/cache/registry.py"]}
+      ]
+    },
+    {
+      "eval_id": "order_terminal_states",
+      "prompt": "In the codebase at `{target_path}`, what are the terminal states for an order, and which file checks these states before finalizing a ledger entry? Also name the two metrics emitted when a refund transitions an order to a terminal state.",
+      "notes": "Requires finding TERMINAL_STATES in status_machine.py, tracing to reconcile/ledger.py for ledger finalization, and refund metrics in refund_service.py. validators.py has INVALID_STATES (distractor).",
+      "assertions": [
+        {"id": "mentions_terminal_states", "kind": "contains_all", "values": ["delivered", "cancelled", "refunded"]},
+        {"id": "mentions_ledger_file", "kind": "contains_all", "values": ["app/reconcile/ledger.py"]},
+        {"id": "mentions_refund_metrics", "kind": "contains_all", "values": ["refund.amount", "refund.count"]}
+      ]
+    }
+  ]
+}

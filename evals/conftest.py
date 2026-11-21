@@ -1,129 +1,36 @@
 import os
 import pathlib
-import tempfile
 import time
-import atexit
-import shutil
 
 import pytest
 
 from rlm_tools.sandbox import Sandbox
 
-APPLE_PROJECT_PATH = os.environ.get(
-    "RLM_EVAL_PROJECT_PATH",
-    str(pathlib.Path(__file__).resolve().parent.parent.parent / "your-iOS-project"),
-)
+import rlm_tools.semantic as semantic
+import rlm_tools.llm_bridge as llm_bridge
 
 
-def _resolve_override(base: pathlib.Path, value: str) -> pathlib.Path:
-    candidate = pathlib.Path(value)
-    if not candidate.is_absolute():
-        candidate = base / candidate
-    return candidate.resolve()
+@pytest.fixture(autouse=True)
+def no_live_model_calls(monkeypatch):
+    """Offline evals must inject model clients."""
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("RLM_RECURSE_GATE", "0")
+
+    def _blocked(*args, **kwargs):
+        raise RuntimeError("live model calls are disabled in evals")
+
+    monkeypatch.setattr(semantic, "get_client", _blocked)
+    monkeypatch.setattr(llm_bridge, "get_client", _blocked)
 
 
-def _swift_file_count(root: pathlib.Path) -> int:
-    try:
-        return sum(1 for _ in root.rglob("*.swift"))
-    except OSError:
-        return 0
+FIXTURES_ROOT = pathlib.Path(__file__).resolve().parents[1] / "tests" / "fixtures"
+DEFAULT_PY_CORPUS_PATH = FIXTURES_ROOT / "rlm_corpus_py"
+DEFAULT_TS_CORPUS_PATH = FIXTURES_ROOT / "rlm_corpus_ts"
+DEFAULT_MIXED_CORPUS_PATH = FIXTURES_ROOT / "rlm_corpus_mixed"
+DEFAULT_LONG_CONTEXT_CORPUS_PATH = FIXTURES_ROOT / "rlm_corpus_longcontext"
 
-
-def _detect_app_root(project_root: pathlib.Path) -> pathlib.Path | None:
-    override = os.environ.get("RLM_EVAL_APP_ROOT")
-    if override:
-        candidate = _resolve_override(project_root, override)
-        return candidate if candidate.is_dir() else None
-
-    candidates: list[tuple[int, pathlib.Path]] = []
-    for child in project_root.iterdir():
-        if not child.is_dir() or child.name.startswith(".") or child.name == "Packages":
-            continue
-        score = _swift_file_count(child)
-        if score > 0:
-            candidates.append((score, child))
-
-    if not candidates:
-        return None
-    return max(candidates, key=lambda x: x[0])[1]
-
-
-def _detect_package_root(project_root: pathlib.Path) -> pathlib.Path | None:
-    override = os.environ.get("RLM_EVAL_PACKAGE_ROOT")
-    if override:
-        candidate = _resolve_override(project_root, override)
-        return candidate if candidate.is_dir() else None
-
-    packages_dir = project_root / "Packages"
-    if not packages_dir.is_dir():
-        return None
-
-    candidates: list[tuple[int, pathlib.Path]] = []
-    for child in packages_dir.iterdir():
-        sources = child / "Sources"
-        if not child.is_dir() or not sources.is_dir():
-            continue
-        score = _swift_file_count(sources)
-        if score > 0:
-            candidates.append((score, child))
-
-    if not candidates:
-        return None
-    return max(candidates, key=lambda x: x[0])[1]
-
-
-def _detect_tests_root(project_root: pathlib.Path, app_root: pathlib.Path) -> pathlib.Path | None:
-    override = os.environ.get("RLM_EVAL_TESTS_ROOT")
-    if override:
-        candidate = _resolve_override(project_root, override)
-        return candidate if candidate.is_dir() else None
-
-    for candidate in (project_root / "appTests", app_root.parent / "appTests"):
-        if candidate.is_dir():
-            return candidate
-    return None
-
-
-def _build_overlay_root(
-    project_root: pathlib.Path,
-    app_root: pathlib.Path,
-    package_root: pathlib.Path | None,
-    tests_root: pathlib.Path | None,
-) -> pathlib.Path:
-    overlay_root = pathlib.Path(tempfile.mkdtemp(prefix="rlm_tools_evals_"))
-    os.symlink(app_root, overlay_root / "app")
-
-    if tests_root:
-        os.symlink(tests_root, overlay_root / "appTests")
-
-    packages_alias = overlay_root / "Packages"
-    packages_alias.mkdir()
-    if package_root:
-        os.symlink(package_root, packages_alias / "DashboardPackage")
-
-    return overlay_root
-
-
-_overlay_root: pathlib.Path | None = None
-_real_project_root = pathlib.Path(APPLE_PROJECT_PATH).resolve()
-if _real_project_root.is_dir():
-    _app_root = _detect_app_root(_real_project_root)
-    _package_root = _detect_package_root(_real_project_root)
-    if _app_root:
-        _tests_root = _detect_tests_root(_real_project_root, _app_root)
-        _overlay_root = _build_overlay_root(
-            project_root=_real_project_root,
-            app_root=_app_root,
-            package_root=_package_root,
-            tests_root=_tests_root,
-        )
-        APPLE_PROJECT_PATH = str(_overlay_root)
-
-
-@atexit.register
-def _cleanup_overlay_root() -> None:
-    if _overlay_root and _overlay_root.exists():
-        shutil.rmtree(_overlay_root, ignore_errors=True)
+APPLE_PROJECT_PATH = os.environ.get("RLM_EVAL_PROJECT_PATH", "")
 
 
 def execute(sandbox: Sandbox, code: str) -> dict:
@@ -136,24 +43,37 @@ def execute(sandbox: Sandbox, code: str) -> dict:
 
 
 @pytest.fixture(scope="session")
-def apple_path():
+def fixture_root():
+    return FIXTURES_ROOT
+
+
+@pytest.fixture(scope="session")
+def sandbox():
+    return Sandbox(base_path=str(DEFAULT_PY_CORPUS_PATH), max_output_chars=50_000)
+
+
+@pytest.fixture(scope="session")
+def ts_sandbox():
+    return Sandbox(base_path=str(DEFAULT_TS_CORPUS_PATH), max_output_chars=50_000)
+
+
+@pytest.fixture(scope="session")
+def mixed_path():
+    return DEFAULT_MIXED_CORPUS_PATH
+
+
+@pytest.fixture(scope="session")
+def external_apple_path():
+    if not APPLE_PROJECT_PATH:
+        pytest.skip("Skipping external dataset evals: set RLM_EVAL_PROJECT_PATH")
+
     path = pathlib.Path(APPLE_PROJECT_PATH)
     if not path.is_dir():
         pytest.skip(
-            "Skipping evals: set RLM_EVAL_PROJECT_PATH to a local your-iOS-project checkout "
+            "Skipping external dataset evals: set RLM_EVAL_PROJECT_PATH to a valid checkout "
             f"(current: {APPLE_PROJECT_PATH})"
         )
     return path
-
-
-@pytest.fixture(scope="session")
-def sandbox(apple_path):
-    return Sandbox(base_path=str(apple_path / "app"), max_output_chars=50_000)
-
-
-@pytest.fixture(scope="session")
-def package_sandbox(apple_path):
-    return Sandbox(base_path=str(apple_path / "Packages" / "DashboardPackage"), max_output_chars=50_000)
 
 
 # --- Timing report plugin ---

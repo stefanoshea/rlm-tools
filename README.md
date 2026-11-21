@@ -2,16 +2,18 @@
 
 <!-- mcp-name: io.github.stefanoshea/rlm-tools -->
 
-Your AI coding agent spends most of its token budget just *reading* your code — not reasoning about it. Every grep, file read, and glob result gets dumped into the conversation. On a large codebase, that's 25-35% of your context (and cost) burned on raw data the model never needed to see.
+Large grep results and file reads can fill an AI coding agent's context window before it has answered the question.
 
 RLM Tools gives your agent a persistent sandbox to explore code in. Data stays server-side. Only the conclusions come back.
 
+RLM Tools keeps raw context in tool-side memory and exposes a genuinely recursive explorer: `rlm_recurse` runs its own server-side tool-use loop (grep/read/glob/tree) and can spawn depth-limited child agents, so a sub-question is answered by exploring the corpus directly instead of dumping it into the root agent's context. Scored evals and prompt benchmarks measure answer quality alongside efficiency.
+
 ```bash
 # For Codex / generic MCP clients
-uvx rlm-tools-setup --write-policy AGENTS.md
+uvx --from rlm-tools rlm-tools-setup --write-policy AGENTS.md
 
 # For Claude Code
-uvx rlm-tools-setup --write-policy CLAUDE.md
+uvx --from rlm-tools rlm-tools-setup --write-policy CLAUDE.md
 ```
 
 This auto-detects Claude/Codex on your PATH, registers the MCP server, and writes a policy block that nudges agents toward `rlm-tools` for repo exploration. Use `CLAUDE.md` for Claude Code (it reads this file automatically) or `AGENTS.md` for other clients.
@@ -46,9 +48,9 @@ for module, ms in sorted(by_module.items(), key=lambda x: -len(x[1]))[:5]:
 
 ## Real-World Impact
 
-In typical coding workflows: **25-35% context reduction.** That means your agent can explore roughly 40-50% more code before hitting context limits.
+On the four checked-in Python and TypeScript fixture tasks, the RLM scripts used **13.6% to 54.5% fewer estimated context characters** than the baseline file and search operations. The estimate counts script or tool arguments, returned text, and 350 characters of overhead per measured turn. It excludes session startup and teardown. Run `uv run --extra dev python -m pytest evals/test_comparative.py -q -s` for the per-task counts. The prompt benchmark measures root-agent token usage and answer quality separately.
 
-In heavy exploration tasks (reading many files, broad searches), savings go much further:
+In heavy exploration tasks (reading many files, broad searches), savings go much further. The table below is a **worst-case** comparison: the "Standard Tools" baseline dumps full grep/file payloads into context, which is the upper bound on what naive tool use costs — a careful agent dumps less. Treat these as the ceiling on savings, not the typical case, and look at the [scored evals](#scored-evals) for whether answer quality holds up at those reductions.
 
 | Scenario | Standard Tools | RLM Tools | Saved |
 |---|---:|---:|---:|
@@ -60,6 +62,21 @@ In heavy exploration tasks (reading many files, broad searches), savings go much
 | Understand a module | 94,745 chars | 16,925 chars | 82.1% |
 
 Full benchmark methodology and reproduction steps: [`docs/benchmarks.md`](docs/benchmarks.md)
+
+## Scored Evals
+
+The repo now carries fixture-backed, always-runnable evals under `evals/` plus checked-in corpora under `tests/fixtures/`.
+
+- `evals/test_correctness.py` checks helper semantics and security boundaries
+- `evals/test_task_completion.py` checks multi-step task workflows
+- `evals/test_comparative.py` keeps context-size microbenchmarks
+- `evals/test_robustness.py` checks error handling and timeout behavior
+- `evals/test_session_effectiveness.py` compares a complete session with targeted Read/Grep, including follow-ups where the baseline can reuse its first result
+- `evals/test_longcontext_quality.py` checks grounded answers and plausible wrong answers on the long-context fixture
+- `evals/test_evidence_effectiveness.py` measures how much tool output the recursive loop replays while checking whether the answer survives filtering
+- `evals/test_stdio_workflow.py` exercises independent sessions and compact responses through the actual stdio server
+
+Prompt benchmarks are defined in [`evals/specs/rlm_core.json`](evals/specs/rlm_core.json) and the harder [`evals/specs/rlm_long_context.json`](evals/specs/rlm_long_context.json), graded by [`evals/grade_eval.py`](evals/grade_eval.py), and aggregated with variance notes plus a pass-rate-first preferred-config summary by [`evals/aggregate_benchmark.py`](evals/aggregate_benchmark.py).
 
 ## How It Works
 
@@ -78,8 +95,35 @@ The sandbox provides built-in helpers:
 - `glob_files(pattern)` — Find files by pattern
 - `tree(path, max_depth)` — Directory structure
 - `llm_query(prompt, context)` — Sub-LLM analysis (optional, requires API key)
+- `rlm_recurse(prompt, context)` — Ask a sub-agent to explore the session directory (optional, requires API key)
 
 Variables persist across `rlm_execute` calls within a session. The agent can build up understanding incrementally — search, filter, read, analyze — without any intermediate data touching the context window.
+
+### Evidence Gate
+
+A `rlm_recurse` sub-agent re-sends every tool result on every turn of its loop, so a
+large file read is paid for once per remaining turn. With `TYPESAFE_API_KEY` set, each
+result is scored in chunks before it joins that history and only the parts bearing on
+the question are kept:
+
+```
+worker_runtime.py   12,247 -> 1,256 chars   1 of 9 chunks kept
+server.py           15,924 -> 1,491 chars   1 of 11 chunks kept
+helpers.py           9,200 -> 3,193 chars   2 of 7 chunks kept
+```
+
+81% of bytes dropped across those reads with every answer still intact. Scoring is
+batched, so judging a dozen chunks costs about what judging one costs.
+
+The gate fails open. A scoring error, an exhausted call budget, a result too small to
+judge, a flat score distribution, or an exhaustive question (`every`, `all`, `list`)
+all return the original text untouched — exhaustive questions need every mention, and
+relevance scores cannot tell the last one from noise.
+
+The gate uses [TypeSafe](https://typesafe.ai) System One models. To enable it, run
+the server with the semantic extra (`uvx --from 'rlm-tools[semantic]' rlm-tools`)
+and pass both `TYPESAFE_API_KEY` and `ANTHROPIC_API_KEY` to the server.
+`RLM_RECURSE_GATE=0` disables scoring.
 
 ## Works With
 
@@ -109,13 +153,13 @@ If your MCP client supports tool permissions or hooks, disable/block default rea
 
 ```bash
 # Auto-detect Claude/Codex CLIs and configure rlm-tools
-uvx rlm-tools-setup
+uvx --from rlm-tools rlm-tools-setup
 
 # Print JSON config snippet for other clients
-uvx rlm-tools-setup --print-json
+uvx --from rlm-tools rlm-tools-setup --print-json
 
 # Print policy text instead of writing it
-uvx rlm-tools-setup --print-policy
+uvx --from rlm-tools rlm-tools-setup --print-policy
 ```
 
 ### Direct run
@@ -139,14 +183,22 @@ Then point your MCP client to `command: uv`, `args: ["--directory", "/path/to/rl
 
 ## Configuration
 
-Copy `.env.example` to `.env` to customize. All settings are optional — RLM Tools works out of the box with zero config.
+Set optional variables in your MCP client's server environment. For a source checkout,
+you can also copy `.env.example` to `.env`, fill in the values you use, and launch
+with `uv run --env-file .env rlm-tools`.
 
-The core exploration features (read, grep, glob, tree) require no API key. The optional `llm_query()` helper calls the Anthropic API for semantic analysis within the sandbox — this is the only feature that requires a key.
+The core exploration features (read, grep, glob, tree) require no API key. `llm_query()` and `rlm_recurse()` call the Anthropic API for semantic analysis within the sandbox. The evidence gate that filters what `rlm_recurse` keeps calls the TypeSafe API. Each is optional — set only the keys for the features you want.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | — | Required for `llm_query()` only. Uses Anthropic's API (Claude). |
-| `RLM_SUB_MODEL` | `claude-haiku-4-5-20251001` | Claude model used for `llm_query()` |
+| `ANTHROPIC_API_KEY` | — | Required for `llm_query()`/`rlm_recurse()` only. Uses Anthropic's API (Claude). |
+| `TYPESAFE_API_KEY` | — | Enables the `rlm_recurse()` evidence gate. Uses TypeSafe's API (Jev). |
+| `TYPESAFE_DEFAULT_MODEL` | `jev-latest` | System One model used by the evidence gate |
+| `RLM_RECURSE_GATE` | `1` | Set to `0` to disable the evidence gate with a key present |
+| `RLM_SUB_MODEL` | `claude-haiku-4-5-20251001` | Claude model used for `llm_query()`/`rlm_recurse()` |
+| `RLM_SUB_TIMEOUT_SECONDS` | `60` | Per-request timeout for sub-LLM calls |
+| `RLM_SUB_MAX_RETRIES` | `3` | Retry attempts for transient sub-LLM failures |
+| `RLM_RECURSE_MAX_DEPTH` | `2` | Max recursion depth for `rlm_recurse()` child agents |
 | `RLM_MAX_SESSIONS` | `5` | Max concurrent sessions |
 | `RLM_SESSION_TIMEOUT` | `10` | Session timeout in minutes |
 
@@ -155,10 +207,14 @@ The core exploration features (read, grep, glob, tree) require no API key. The o
 The sandbox is read-only and restricted:
 
 - **Imports**: Safe stdlib only (re, json, collections, math, etc.)
-- **Builtins**: Blocks exec, eval, compile, `__import__`, breakpoint
-- **File access**: Read-only, scoped to session directory, path traversal blocked
-- **Execution**: Configurable per-call timeout (default 30s)
-- **Rate limits**: Configurable max calls per session
+- **Builtins**: Blocks exec, eval, compile, `__import__`, getattr/setattr, breakpoint
+- **Attribute access**: AST guard blocks dunder access (`x.__class__`); runtime string-to-attribute resolvers are closed off too — `str.format`/`format_map` are blocked (use f-strings) and `operator.attrgetter`/`methodcaller` and `string.Formatter` are stripped on import, since those bypass the AST guard and can be aliased
+- **File access**: Read-only, scoped to session directory, path traversal blocked, and symlinks resolving outside the root are skipped by both `read_file` and `grep`
+- **File freshness**: Cached reads are keyed by mtime, so an edited file is re-read rather than served stale
+- **Execution**: On POSIX the worker has a configurable execution timeout (default 30s). A helper already running in the parent finishes before the timeout is reported. Model requests have their own timeout and retry settings. CPU and address-space limits depend on OS support.
+- **Rate limits**: Configurable max execute/LLM calls, memory, and output per session
+
+The implementation uses a worker-backed execution boundary (a separate spawned process) and hardened helper exposure. The exploration helpers themselves run in the trusted parent process, not the worker — `_resolve_safe` is the path boundary. This is safer than the original in-process version, but it should still be treated as a constrained execution environment, not a complete OS sandbox.
 
 ## Background
 
@@ -169,15 +225,29 @@ RLM Tools implements an [RLM-style](https://arxiv.org/abs/2512.24601) exploratio
 ```bash
 git clone https://github.com/stefanoshea/rlm-tools.git
 cd rlm-tools
-uv sync --dev
-pytest tests
+uv sync --locked --extra dev
+uv run --no-sync python -m pytest
 ```
 
-Run comparative benchmarks (requires a local project checkout):
+Run fixture-backed evals:
 
 ```bash
-RLM_EVAL_PROJECT_PATH=/path/to/project pytest evals -q -s
+uv run python -m pytest evals -q
 ```
+
+Run comparative benchmarks:
+
+```bash
+uv run python -m pytest evals/test_comparative.py -q -s
+```
+
+Run scored prompt benchmarks:
+
+```bash
+./evals/run_ab_eval.sh
+```
+
+By default this now runs the checked-in long-context benchmark corpus at `tests/fixtures/rlm_corpus_longcontext`. Use `RLM_AB_SPEC_PATH` and `RLM_AB_TARGET_PATH` to switch back to lighter smoke-style cases or to point at a different corpus.
 
 ## License
 

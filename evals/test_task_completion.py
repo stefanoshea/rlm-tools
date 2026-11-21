@@ -1,127 +1,114 @@
 import json as _json
 
-from conftest import execute
+from evals.conftest import execute
 
 
 class TestMultiStepSearchWorkflows:
-    def test_find_and_read_dashboard_files(self, sandbox):
+    def test_find_and_read_service_files(self, sandbox):
         result1 = execute(
             sandbox,
-            "dashboard_files = glob_files('app/Dashboard/*.swift')\nprint(len(dashboard_files))",
+            "service_files = glob_files('services/*.py')\nprint(len(service_files))",
         )
         assert result1["error"] is None
-        count = int(result1["stdout"].strip())
-        assert count >= 5, f"Expected at least 5 Dashboard Swift files, got {count}"
+        assert int(result1["stdout"].strip()) == 2
 
-        result2 = execute(sandbox, "sample = read_file(dashboard_files[0])\nprint(len(sample))")
+        result2 = execute(
+            sandbox,
+            "sample = read_file(service_files[0])\nprint('class ' in sample)",
+        )
         assert result2["error"] is None
-        assert "dashboard_files" in result2["variables"]
-        assert "sample" in result2["variables"]
-        assert int(result2["stdout"].strip()) > 0
+        assert result2["stdout"].strip() == "True"
 
-    def test_find_protocol_and_read_definition(self, sandbox):
+    def test_find_class_and_read_definition(self, sandbox):
         result1 = execute(
             sandbox,
-            "import json\nprotocol_defs = grep('protocol DashboardBuilding', 'app/Dashboard')\nprint(json.dumps(protocol_defs))",
+            "import json\nservice_defs = grep('class UserService')\nprint(json.dumps(service_defs))",
         )
         assert result1["error"] is None
         defs = _json.loads(result1["stdout"])
-        assert len(defs) >= 1
-
-        protocol_file = defs[0]["file"]
-        result2 = execute(sandbox, f"content = read_file('{protocol_file}')\nprint(len(content.splitlines()))")
-        assert result2["error"] is None
-        assert "content" in result2["variables"]
-
-    def test_explore_test_directory(self, sandbox):
-        result1 = execute(sandbox, "test_tree = tree('appTests/Dashboard', max_depth=1)\nprint(test_tree)")
-        assert result1["error"] is None
-        assert "DashboardBuilderTests.swift" in result1["stdout"]
+        assert len(defs) == 1
 
         result2 = execute(
             sandbox,
-            "import json\ntest_files = glob_files('appTests/Dashboard/*.swift')\nprint(json.dumps(test_files))",
+            "content = read_file('services/user_service.py')\nprint('load_user_profile' in content)",
+        )
+        assert result2["error"] is None
+        assert result2["stdout"].strip() == "True"
+
+    def test_explore_typescript_directory(self, ts_sandbox):
+        result1 = execute(ts_sandbox, "tree_output = tree('src', max_depth=1)\nprint(tree_output)")
+        assert result1["error"] is None
+        assert "dashboard.ts" in result1["stdout"]
+
+        result2 = execute(
+            ts_sandbox,
+            "import json\nts_files = glob_files('src/*.ts')\nprint(json.dumps(sorted(ts_files)))",
         )
         assert result2["error"] is None
         files = _json.loads(result2["stdout"])
-        filenames = [f.split("/")[-1] for f in files]
-        assert "DashboardBuilderTests.swift" in filenames
-
-    def test_package_source_exploration(self, package_sandbox):
-        result1 = execute(package_sandbox, "pkg_tree = tree('.', max_depth=2)\nprint(pkg_tree)")
-        assert result1["error"] is None
-        assert "Sources" in result1["stdout"]
-
-        result2 = execute(
-            package_sandbox,
-            "pkg_sources = glob_files('Sources/**/*.swift')\nprint(len(pkg_sources))",
-        )
-        assert result2["error"] is None
-        assert int(result2["stdout"].strip()) >= 5
+        assert files == ["src/dashboard.ts", "src/deps.ts"]
 
 
 class TestVariablePersistence:
     def test_variables_persist_across_three_calls(self, sandbox):
-        execute(sandbox, "step1_data = glob_files('app/Dashboard/*.swift')")
+        execute(sandbox, "step1_data = glob_files('services/*.py')")
         execute(sandbox, "step2_count = len(step1_data)")
-        result3 = execute(sandbox, "print(f'Found {step2_count} files from step1')")
+        result3 = execute(sandbox, "print(f'Found {step2_count} service files')")
 
         assert result3["error"] is None
-        assert "Found" in result3["stdout"]
-        assert "files from step1" in result3["stdout"]
+        assert "Found 2 service files" in result3["stdout"]
         assert "step1_data" in result3["variables"]
         assert "step2_count" in result3["variables"]
 
     def test_variable_mutation_persists(self, sandbox):
-        execute(sandbox, "import json\naccumulator_eval = []")
+        execute(sandbox, "accumulator_eval = []")
         execute(sandbox, "accumulator_eval.append('first')")
         execute(sandbox, "accumulator_eval.append('second')")
-        result = execute(sandbox, "print(json.dumps(accumulator_eval))")
+        result = execute(sandbox, "print(','.join(accumulator_eval))")
 
         assert result["error"] is None
-        items = _json.loads(result["stdout"])
-        assert items == ["first", "second"]
+        assert result["stdout"].strip() == "first,second"
 
     def test_computed_results_reusable(self, sandbox):
-        execute(sandbox, "all_app_swift = glob_files('app/**/*.swift')")
-        execute(sandbox, "dash_only = [f for f in all_app_swift if 'Dashboard' in f]")
+        execute(sandbox, "all_python = glob_files('**/*.py')")
+        execute(sandbox, "service_only = [f for f in all_python if f.startswith('services/')]")
         result = execute(
             sandbox,
-            "print(f'{len(dash_only)} dashboard files out of {len(all_app_swift)} total')",
+            "print(f'{len(service_only)} service files out of {len(all_python)} total')",
         )
         assert result["error"] is None
-        assert "dashboard files out of" in result["stdout"]
+        assert "service files out of" in result["stdout"]
 
 
 class TestSearchChains:
-    def test_find_type_then_find_its_usages(self, sandbox):
+    def test_find_type_then_find_usages(self, sandbox):
         result1 = execute(
             sandbox,
-            "import json\nbuilder_defs = grep('class DashboardBuilder', 'app/Dashboard')\nprint(json.dumps(builder_defs[:3]))",
+            "import json\nservice_defs = grep('class UserService')\nprint(json.dumps(service_defs))",
         )
         assert result1["error"] is None
 
         result2 = execute(
             sandbox,
-            "import json\nusages = grep('DashboardBuilder', 'app')\nusage_files = list(set(r['file'] for r in usages))\nprint(json.dumps(usage_files[:10]))",
+            "import json\nusages = grep('UserService')\nusage_files = sorted(set(r['file'] for r in usages))\nprint(json.dumps(usage_files))",
         )
         assert result2["error"] is None
         files = _json.loads(result2["stdout"])
-        assert len(files) >= 2, f"Expected DashboardBuilder used in multiple files: {files}"
+        assert files == ["app.py", "services/user_service.py"]
 
-    def test_find_import_then_trace_reducers(self, sandbox):
+    def test_find_import_then_trace_dependencies(self, ts_sandbox):
         result1 = execute(
-            sandbox,
-            "import json\ntca_users = grep('import ComposableArchitecture', 'app')\ntca_files = list(set(r['file'] for r in tca_users))\nprint(len(tca_files))",
+            ts_sandbox,
+            "imports = grep('import', 'src')\nprint(len(imports))",
         )
         assert result1["error"] is None
-        tca_count = int(result1["stdout"].strip())
-        assert tca_count >= 1
+        assert int(result1["stdout"].strip()) >= 1
 
         result2 = execute(
-            sandbox,
-            "import json\nreducers = grep('@Reducer', 'app')\nreducer_files = list(set(r['file'] for r in reducers))\nprint(json.dumps(reducer_files[:10]))",
+            ts_sandbox,
+            "import json\ndeps = grep('apiClient|clock|logger', 'src/dashboard.ts')\nprint(json.dumps(sorted(set(r['line'].strip() for r in deps))))",
         )
         assert result2["error"] is None
-        reducer_files = _json.loads(result2["stdout"])
-        assert len(reducer_files) >= 1
+        lines = _json.loads(result2["stdout"])
+        assert any("apiClient" in line for line in lines)
+        assert any("clock" in line for line in lines)

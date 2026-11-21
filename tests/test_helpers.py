@@ -1,5 +1,6 @@
 import os
 import tempfile
+import pytest
 from rlm_tools.helpers import make_helpers
 
 
@@ -34,6 +35,17 @@ def test_grep():
         results = helpers["grep"]("def.*hello")
         assert len(results) > 0
         assert "hello" in results[0]["line"]
+
+
+def test_grep_respects_max_matches():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for i in range(4):
+            with open(os.path.join(tmpdir, f"code{i}.py"), "w") as f:
+                f.write("def shared():\n    pass\n")
+
+        helpers, _ = make_helpers(tmpdir)
+        results = helpers["grep"]("def", max_matches=2)
+        assert len(results) == 2
 
 
 def test_glob_files():
@@ -82,7 +94,23 @@ def test_read_files_handles_missing():
         assert "[error:" in result["missing.txt"]
 
 
-def test_read_file_cache():
+def test_read_file_cache_serves_unchanged_file():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_file = os.path.join(tmpdir, "cached.txt")
+        with open(test_file, "w") as f:
+            f.write("original")
+        st = os.stat(test_file)
+
+        helpers, _ = make_helpers(tmpdir)
+        first = helpers["read_file"]("cached.txt")
+        # Pin mtime so the file looks unchanged; cached value should be reused.
+        os.utime(test_file, (st.st_atime, st.st_mtime))
+        second = helpers["read_file"]("cached.txt")
+        assert first == "original"
+        assert second == "original"
+
+
+def test_read_file_cache_invalidates_on_modification():
     with tempfile.TemporaryDirectory() as tmpdir:
         test_file = os.path.join(tmpdir, "cached.txt")
         with open(test_file, "w") as f:
@@ -94,9 +122,99 @@ def test_read_file_cache():
 
         with open(test_file, "w") as f:
             f.write("modified")
+        # Force a strictly newer mtime so the change is detectable regardless of
+        # filesystem timestamp resolution.
+        st = os.stat(test_file)
+        os.utime(test_file, (st.st_atime, st.st_mtime + 10))
 
         second = helpers["read_file"]("cached.txt")
-        assert second == "original"  # cached, not re-read
+        assert second == "modified"
+
+
+def test_read_file_respects_max_bytes_read():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_file = os.path.join(tmpdir, "large.txt")
+        with open(test_file, "w") as f:
+            f.write("a" * 200)
+
+        helpers, _ = make_helpers(tmpdir)
+        content = helpers["read_file"]("large.txt", max_bytes_read=20)
+        assert "... [read truncated]" in content
+
+
+def test_truncated_read_does_not_poison_later_full_read():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_file = os.path.join(tmpdir, "large.txt")
+        original = "abcdefghij" * 20
+        with open(test_file, "w") as f:
+            f.write(original)
+
+        helpers, _ = make_helpers(tmpdir)
+        truncated = helpers["read_file"]("large.txt", max_bytes_read=20)
+        full = helpers["read_file"]("large.txt")
+
+        assert "... [read truncated]" in truncated
+        assert full == original
+
+
+def test_bounded_read_only_caches_complete_content(tmp_path):
+    (tmp_path / "large.txt").write_text("é" * 1000, encoding="utf-8")
+    cache_sizes = []
+    helpers, _ = make_helpers(str(tmp_path), memory_tracker=cache_sizes.append)
+
+    assert helpers["read_file"]("large.txt", max_bytes_read=3) == "é\n... [read truncated]"
+    assert cache_sizes == []
+    assert helpers["read_file"]("large.txt") == "é" * 1000
+    assert cache_sizes == [2000]
+
+
+def test_cache_charges_only_retained_bytes_after_edits(tmp_path):
+    path = tmp_path / "notes.txt"
+    charges = []
+    helpers, _ = make_helpers(str(tmp_path), memory_tracker=charges.append)
+    for content in ("12345", "hello world", "é"):
+        path.write_text(content, encoding="utf-8")
+        assert helpers["read_file"]("notes.txt") == content
+        assert sum(charges) == len(content.encode("utf-8"))
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFO support")
+def test_read_file_skips_named_pipe(tmp_path):
+    os.mkfifo(tmp_path / "events")
+    helpers, _ = make_helpers(str(tmp_path))
+    assert "regular file" in helpers["read_files"](["events"])["events"]
+
+
+def test_grep_preserves_splitlines_and_end_anchors(tmp_path):
+    (tmp_path / "notes.txt").write_text("a\nb\u2028c\n\nd\n")
+    helpers, _ = make_helpers(str(tmp_path))
+    results = helpers["grep"](r"c\Z|^$")
+    assert [(m["line_number"], m["line"]) for m in results] == [(3, "c"), (4, "")]
+
+
+def test_read_file_does_not_cache_content_when_memory_tracking_fails():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_file = os.path.join(tmpdir, "large.txt")
+        with open(test_file, "w") as f:
+            f.write("a" * 5000)
+
+        def fail_if_large(size: int) -> None:
+            if size > 1024:
+                raise MemoryError("too large")
+
+        helpers, _ = make_helpers(tmpdir, memory_tracker=fail_if_large)
+
+        try:
+            helpers["read_file"]("large.txt")
+            assert False, "Expected MemoryError on first read"
+        except MemoryError:
+            pass
+
+        try:
+            helpers["read_file"]("large.txt")
+            assert False, "Expected MemoryError on second read too"
+        except MemoryError:
+            pass
 
 
 def test_grep_summary():

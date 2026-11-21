@@ -1,3 +1,5 @@
+import tempfile
+
 from rlm_tools.sandbox import Sandbox
 
 
@@ -39,3 +41,60 @@ def test_list_variables():
     variables = sandbox.list_variables()
     assert "foo" in variables
     assert "bar" in variables
+
+
+def test_helper_globals_are_not_visible_to_user_code(tmp_path):
+    sandbox = Sandbox(base_path=str(tmp_path), max_output_chars=10_000)
+    result = sandbox.execute("print(hasattr(read_file, '__globals__'))")
+    assert result.stdout.strip() == "False"
+    assert result.error is None
+
+
+def test_helper_globals_cannot_escape_sandbox(tmp_path):
+    target = tmp_path / "allowed.txt"
+    target.write_text("allowed")
+
+    sandbox = Sandbox(base_path=str(tmp_path), max_output_chars=10_000)
+    result = sandbox.execute(
+        "print(read_file.__globals__['pathlib'].Path('/etc/hosts').read_text())"
+    )
+    assert result.error is not None
+
+
+def test_read_file_globals_escape_is_blocked():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sandbox = Sandbox(base_path=tmpdir, max_output_chars=10_000)
+        result = sandbox.execute(
+            "print(read_file.__globals__['pathlib'].Path('/etc/hosts').read_text())"
+        )
+
+        assert result.error is not None
+        assert "AttributeError" in result.error or "PermissionError" in result.error
+
+
+def test_object_cannot_expose_helper_proxy_internals(tmp_path):
+    sandbox = Sandbox(base_path=str(tmp_path), max_output_chars=10_000)
+    result = sandbox.execute("object.__getattribute__(read_file, '_conn')")
+    assert result.error is not None
+
+
+def test_object_cannot_expose_finalize_callback_internals(tmp_path):
+    sandbox = Sandbox(base_path=str(tmp_path), max_output_chars=10_000)
+    result = sandbox.execute("object.__getattribute__(rlm_finalize, '_callback')")
+    assert result.error is not None
+
+
+def test_mro_recovery_cannot_expose_helper_proxy_internals(tmp_path):
+    sandbox = Sandbox(base_path=str(tmp_path), max_output_chars=10_000)
+    result = sandbox.execute(
+        "(()).__class__.__mro__[1].__getattribute__(read_file, '_conn')"
+    )
+    assert result.error is not None
+
+
+def test_mro_recovery_cannot_expose_finalize_callback_internals(tmp_path):
+    sandbox = Sandbox(base_path=str(tmp_path), max_output_chars=10_000)
+    result = sandbox.execute(
+        "(()).__class__.__mro__[1].__getattribute__(rlm_finalize, '_callback')"
+    )
+    assert result.error is not None

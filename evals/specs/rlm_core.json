@@ -1,0 +1,21 @@
+{
+  "evals": [
+    {
+      "eval_id": "find_user_service_usages",
+      "prompt": "Search the Python fixture at `{target_path}/rlm_corpus_py` for UserService. Name the symbol and list the files where it appears, relative to that fixture.",
+      "assertions": [
+        {"id": "mentions_user_service", "kind": "contains_all", "values": ["UserService"]},
+        {"id": "mentions_app_file", "kind": "contains_all", "values": ["app.py"]},
+        {"id": "mentions_service_file", "kind": "contains_all", "values": ["services/user_service.py"]}
+      ]
+    },
+    {
+      "eval_id": "list_dashboard_dependencies",
+      "prompt": "Read the TypeScript fixture at `{target_path}/rlm_corpus_ts`. Name the reducer class in src/dashboard.ts that declares two dependency fields and identify the two dependencies assigned to those fields.",
+      "assertions": [
+        {"id": "mentions_dashboard_reducer", "kind": "contains_all", "values": ["DashboardReducer"]},
+        {"id": "mentions_api_client", "kind": "contains_all", "values": ["apiClient"]},
+        {"id": "mentions_clock", "kind": "contains_all", "values": ["clock"]}
+      ]
+    }
+  ]

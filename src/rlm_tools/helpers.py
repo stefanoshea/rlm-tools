@@ -1,6 +1,10 @@
 import os
 import pathlib
 import re
+import stat
+import threading
+from collections.abc import Callable
+from itertools import chain
 
 
 _SKIP_DIRS = {
@@ -28,9 +32,13 @@ def _walk_files(root: pathlib.Path):
             yield pathlib.Path(dirpath) / fname
 
 
-def make_helpers(base_path: str) -> tuple[dict, callable]:
+def make_helpers(
+    base_path: str,
+    memory_tracker: Callable[[int], None] | None = None,
+) -> tuple[dict, callable]:
     base = pathlib.Path(base_path).resolve()
-    _file_cache: dict[str, str] = {}
+    _file_cache: dict[pathlib.Path, tuple[tuple[int, int], str]] = {}
+    cache_lock = threading.Lock()
 
     def _resolve_safe(path: str) -> pathlib.Path:
         resolved = (base / path).resolve()
@@ -40,29 +48,60 @@ def make_helpers(base_path: str) -> tuple[dict, callable]:
             raise PermissionError(f"Access denied: path '{path}' escapes sandbox root")
         return resolved
 
-    def read_file(path: str) -> str:
-        target = _resolve_safe(path)
-        cache_key = str(target)
-        if cache_key in _file_cache:
-            return _file_cache[cache_key]
-        content = target.read_text(errors="replace")
-        _file_cache[cache_key] = content
-        return content
+    def _within_base(file_path: pathlib.Path) -> bool:
+        try:
+            file_path.resolve().relative_to(base)
+            return True
+        except (ValueError, OSError, RuntimeError):
+            return False
 
-    def read_files(paths: list[str]) -> dict[str, str]:
+    def read_file(path: str, max_bytes_read: int | None = None) -> str:
+        if max_bytes_read is not None and max_bytes_read < 0:
+            raise ValueError("max_bytes_read must be non-negative")
+        target = _resolve_safe(path)
+        with cache_lock:
+            info = target.stat()
+            if stat.S_ISDIR(info.st_mode):
+                raise IsADirectoryError(str(target))
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError(f"Expected a regular file: {path}")
+            version = (info.st_mtime_ns, info.st_size)
+            cached = _file_cache.get(target)
+            cache_hit = cached is not None and cached[0] == version
+            if cache_hit:
+                content = cached[1]
+            else:
+                with target.open(errors="replace") as file:
+                    content = file.read() if max_bytes_read is None else file.read(max_bytes_read + 1)
+
+            if max_bytes_read is not None:
+                encoded = content[:max_bytes_read + 1].encode("utf-8")
+                if len(encoded) > max_bytes_read:
+                    return encoded[:max_bytes_read].decode("utf-8", errors="ignore") + "\n... [read truncated]"
+            if not cache_hit:
+                if memory_tracker is not None:
+                    old_size = len(cached[1].encode("utf-8")) if cached else 0
+                    memory_tracker(len(content.encode("utf-8")) - old_size)
+                _file_cache[target] = (version, content)
+            return content
+
+    def read_files(paths: list[str], max_bytes_read: int | None = None) -> dict[str, str]:
         """Read multiple files at once. Returns {path: content} dict."""
         result = {}
         for path in paths:
             try:
-                result[path] = read_file(path)
+                result[path] = read_file(path, max_bytes_read=max_bytes_read)
             except (OSError, PermissionError) as e:
                 result[path] = f"[error: {e}]"
         return result
 
-    def grep(pattern: str, path: str = ".") -> list[dict]:
+    def grep(pattern: str, path: str = ".", max_matches: int | None = None) -> list[dict]:
         target = _resolve_safe(path)
         compiled = re.compile(pattern)
         results = []
+
+        if max_matches is not None and max_matches <= 0:
+            return results
 
         if target.is_file():
             search_paths = [target]
@@ -72,24 +111,31 @@ def make_helpers(base_path: str) -> tuple[dict, callable]:
         for file_path in search_paths:
             if not file_path.is_file():
                 continue
+            # Skip symlinks (or any path) that resolve outside the sandbox root.
+            if not _within_base(file_path):
+                continue
             ext = file_path.suffix.lower()
             if ext in _BINARY_EXTENSIONS:
                 continue
             try:
-                for i, line in enumerate(file_path.read_text(errors="replace").splitlines(), 1):
-                    if compiled.search(line):
-                        results.append({
-                            "file": str(file_path.relative_to(base)),
-                            "line_number": i,
-                            "line": line.strip(),
-                        })
+                with file_path.open(errors="replace") as source:
+                    lines = chain.from_iterable(map(str.splitlines, source))
+                    for i, line in enumerate(lines, 1):
+                        if compiled.search(line):
+                            results.append({
+                                "file": str(file_path.relative_to(base)),
+                                "line_number": i,
+                                "line": line.strip(),
+                            })
+                            if max_matches is not None and len(results) >= max_matches:
+                                return results
             except (OSError, UnicodeDecodeError):
                 continue
         return results
 
-    def grep_summary(pattern: str, path: str = ".") -> str:
+    def grep_summary(pattern: str, path: str = ".", max_matches: int | None = None) -> str:
         """Grep with compact output grouped by file. Returns a formatted string."""
-        results = grep(pattern, path)
+        results = grep(pattern, path, max_matches=max_matches)
         if not results:
             return "No matches found."
 
@@ -109,6 +155,8 @@ def make_helpers(base_path: str) -> tuple[dict, callable]:
         path: str = ".",
         max_files: int = 10,
         context_lines: int = 0,
+        max_matches: int | None = None,
+        max_bytes_read: int | None = None,
     ) -> dict:
         """Grep then auto-read matching files. Returns match info + file contents.
 
@@ -121,7 +169,7 @@ def make_helpers(base_path: str) -> tuple[dict, callable]:
         Returns:
             Dict with 'matches' (grouped by file) and 'files' (full contents).
         """
-        results = grep(pattern, path)
+        results = grep(pattern, path, max_matches=max_matches)
         if not results:
             return {"matches": {}, "files": {}, "summary": "No matches found."}
 
@@ -133,7 +181,7 @@ def make_helpers(base_path: str) -> tuple[dict, callable]:
         file_contents = {}
         for fp in file_paths:
             try:
-                content = read_file(fp)
+                content = read_file(fp, max_bytes_read=max_bytes_read)
                 if context_lines > 0:
                     content_lines = content.splitlines()
                     relevant = set()
@@ -189,11 +237,14 @@ def make_helpers(base_path: str) -> tuple[dict, callable]:
                 entries = sorted(dir_path.iterdir(), key=lambda e: (not e.is_dir(), e.name))
             except PermissionError:
                 return
-            visible = [e for e in entries if not e.name.startswith(".") and e.name not in _SKIP_DIRS]
+            visible = [
+                e for e in entries
+                if not e.name.startswith(".") and e.name not in _SKIP_DIRS and _within_base(e)
+            ]
             for i, entry in enumerate(visible):
                 connector = "└── " if i == len(visible) - 1 else "├── "
                 lines.append(f"{prefix}{connector}{entry.name}")
-                if entry.is_dir():
+                if entry.is_dir() and not entry.is_symlink():
                     extension = "    " if i == len(visible) - 1 else "│   "
                     _walk(entry, prefix + extension, depth + 1)
 

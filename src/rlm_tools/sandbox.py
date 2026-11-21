@@ -1,25 +1,14 @@
-import io
-import contextlib
-import builtins
-import pathlib
-import signal
+import multiprocessing
 import threading
-from contextlib import contextmanager
+import time
 from dataclasses import dataclass
 
 from rlm_tools.helpers import make_helpers
+from rlm_tools.worker_protocol import receive_message, send_message
+from rlm_tools.worker_runtime import worker_main
 
 
-ALLOWED_MODULES = frozenset({
-    "re", "json", "collections", "math",
-    "fnmatch", "itertools", "functools", "operator", "string",
-    "textwrap", "difflib", "statistics",
-})
-
-BLOCKED_BUILTINS = frozenset({
-    "exec", "eval", "compile", "__import__", "breakpoint",
-    "exit", "quit", "input",
-})
+_WORKER_RESPONSE_GRACE_SECONDS = 1
 
 
 @dataclass
@@ -27,17 +16,8 @@ class ExecutionResult:
     stdout: str
     error: str | None
     variables: list[str]
-
-
-def _make_restricted_import(allowed: frozenset[str]):
-    original_import = builtins.__import__
-
-    def restricted_import(name, *args, **kwargs):
-        if name not in allowed and name.split(".")[0] not in allowed:
-            raise ImportError(f"Import of '{name}' is not allowed in the sandbox")
-        return original_import(name, *args, **kwargs)
-
-    return restricted_import
+    final: dict | None = None
+    memory_bytes_used: int = 0
 
 
 class Sandbox:
@@ -46,91 +26,219 @@ class Sandbox:
         base_path: str,
         max_output_chars: int = 15_000,
         execution_timeout_seconds: int = 30,
+        max_memory_bytes: int = 10_000_000,
+        max_address_space_bytes: int | None = None,
+        cpu_seconds: int = 600,
     ):
         self._base_path = base_path
         self._max_output_chars = max_output_chars
         self._execution_timeout_seconds = execution_timeout_seconds
-        self._namespace: dict = {}
-        self._resolve_safe = None
-        self._setup_namespace()
+        self._max_memory_bytes = max_memory_bytes
+        # OS-level backstop ceiling for the worker's virtual address space, well
+        # above the precise per-session byte cap. Stops a single runaway
+        # allocation from OOMing the host before the post-exec accounting runs.
+        # No-op where the platform ignores RLIMIT_AS (e.g. macOS).
+        if max_address_space_bytes is None:
+            max_address_space_bytes = max(1_073_741_824, max_memory_bytes * 8 + 536_870_912)
+        self._max_address_space_bytes = max_address_space_bytes
+        self._cpu_seconds = cpu_seconds
+        self._helper_memory_bytes_used = 0
+        self._worker_memory_bytes_used = 0
+        self._worker_unavailable_error = "RuntimeError: Sandbox worker is unavailable"
+        self._last_variables: list[str] = []
+        self._worker_lock = threading.Lock()
+        self._helpers, _ = make_helpers(self._base_path, memory_tracker=self._track_memory)
+        self._tools: dict[str, object] = dict(self._helpers)
 
-    def _setup_namespace(self) -> None:
-        safe_builtins = {
-            k: v for k, v in builtins.__dict__.items()
-            if k not in BLOCKED_BUILTINS
-        }
-        safe_builtins["__import__"] = _make_restricted_import(ALLOWED_MODULES)
+        ctx = multiprocessing.get_context("spawn")
+        self._parent_conn, child_conn = ctx.Pipe()
+        self._process = ctx.Process(
+            target=worker_main,
+            args=(
+                child_conn,
+                self._max_output_chars,
+                self._execution_timeout_seconds,
+                self._max_memory_bytes,
+                self._max_address_space_bytes,
+                self._cpu_seconds,
+            ),
+        )
+        try:
+            try:
+                self._process.start()
+            finally:
+                child_conn.close()
+            self._register_tools(list(self._helpers))
+        except BaseException:
+            self.close()
+            raise
 
-        original_open = builtins.open
+    def _register_tools(self, names: list[str]) -> None:
+        send_message(self._parent_conn, {
+            "type": "register_tools",
+            "names": names,
+        })
+        message = receive_message(self._parent_conn)
+        if message["type"] != "ack":
+            raise RuntimeError("Failed to register tools with worker")
 
-        def restricted_open(file, mode="r", *args, **kwargs):
-            if any(c in mode for c in "wxa+"):
-                raise PermissionError(f"Write access denied in sandbox (mode='{mode}')")
+    def register_tool(self, name: str, func) -> None:
+        with self._worker_lock:
+            self._register_tools([name])
+            self._tools[name] = func
 
-            if self._resolve_safe is None:
-                raise RuntimeError("Sandbox path resolver was not initialized")
+    @property
+    def helpers(self) -> dict:
+        """The server-side exploration helpers (read_file, grep, ...)."""
+        return dict(self._helpers)
 
-            if isinstance(file, int):
-                raise PermissionError("File descriptor access is not allowed in sandbox")
-
-            # Keep read access scoped to the sandbox root.
-            safe_path = self._resolve_safe(str(pathlib.Path(file)))
-            return original_open(safe_path, mode, *args, **kwargs)
-
-        safe_builtins["open"] = restricted_open
-
-        self._namespace["__builtins__"] = safe_builtins
-
-        helpers, self._resolve_safe = make_helpers(self._base_path)
-        self._namespace.update(helpers)
-
-    @contextmanager
-    def _execution_timeout(self):
-        if (
-            self._execution_timeout_seconds <= 0
-            or threading.current_thread() is not threading.main_thread()
-            or not hasattr(signal, "SIGALRM")
-        ):
-            yield
+    def _handle_helper_call(self, message: dict) -> None:
+        name = message["name"]
+        tool = self._tools.get(name)
+        if tool is None:
+            send_message(self._parent_conn, {
+                "type": "helper_result",
+                "value": None,
+                "error": f"RuntimeError: Unknown helper '{name}'",
+            })
             return
 
-        def _raise_timeout(_signum, _frame):
-            raise TimeoutError(
-                f"Execution timed out after {self._execution_timeout_seconds} seconds"
-            )
-
-        previous_handler = signal.getsignal(signal.SIGALRM)
-        signal.signal(signal.SIGALRM, _raise_timeout)
-        signal.setitimer(signal.ITIMER_REAL, self._execution_timeout_seconds)
         try:
-            yield
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, previous_handler)
+            value = tool(*message["args"], **message["kwargs"])
+            send_message(self._parent_conn, {
+                "type": "helper_result",
+                "value": value,
+                "error": None,
+            })
+        except Exception as e:
+            send_message(self._parent_conn, {
+                "type": "helper_result",
+                "value": None,
+                "error": f"{type(e).__name__}: {e}",
+            })
 
     def execute(self, code: str) -> ExecutionResult:
-        stdout_capture = io.StringIO()
-        error = None
+        with self._worker_lock:
+            if self._parent_conn.closed:
+                return self._unavailable_result()
+            try:
+                return self._execute(code)
+            except (EOFError, OSError):
+                self._close_worker()
+                return self._unavailable_result()
 
-        try:
-            with contextlib.redirect_stdout(stdout_capture):
-                with self._execution_timeout():
-                    exec(code, self._namespace)
-        except Exception as e:
-            error = f"{type(e).__name__}: {e}"
-
-        stdout = stdout_capture.getvalue()
-        if len(stdout) > self._max_output_chars:
-            stdout = stdout[:self._max_output_chars] + "\n... [output truncated]"
-
+    def _unavailable_result(self, error: str | None = None) -> ExecutionResult:
         return ExecutionResult(
-            stdout=stdout,
-            error=error,
+            stdout="",
+            error=error or self._worker_unavailable_error,
             variables=self.list_variables(),
+            memory_bytes_used=self.memory_bytes_used,
         )
 
+    def _expire_execution(self) -> ExecutionResult:
+        self._worker_unavailable_error = "RuntimeError: Sandbox worker was closed after an execution timeout"
+        self._close_worker(graceful=False)
+        return self._unavailable_result(
+            f"TimeoutError: Worker did not return after {self._execution_timeout_seconds} seconds. "
+            "Worker state was discarded."
+        )
+
+    def _execute(self, code: str) -> ExecutionResult:
+        send_message(self._parent_conn, {"type": "execute", "code": code})
+
+        deadline = None
+        if self._execution_timeout_seconds > 0:
+            deadline = time.monotonic() + self._execution_timeout_seconds
+        response_deadline = None if deadline is None else deadline + _WORKER_RESPONSE_GRACE_SECONDS
+
+        while True:
+            if response_deadline is not None and not self._parent_conn.poll(max(0, response_deadline - time.monotonic())):
+                return self._expire_execution()
+
+            message = receive_message(self._parent_conn)
+            kind = message["type"]
+
+            if kind == "helper_call":
+                if deadline is not None and time.monotonic() >= deadline:
+                    return self._expire_execution()
+                self._handle_helper_call(message)
+                if response_deadline is not None:
+                    # The worker must drain a synchronous helper response before
+                    # its own execution timer can surface a timeout.
+                    response_deadline = max(response_deadline, time.monotonic() + _WORKER_RESPONSE_GRACE_SECONDS)
+                continue
+
+            if kind != "execute_result":
+                raise RuntimeError(f"Unexpected worker message '{kind}'")
+
+            self._last_variables = message["variables"]
+            self._worker_memory_bytes_used = message.get("memory_bytes_used", 0)
+            memory_bytes_used = self.memory_bytes_used
+            if memory_bytes_used > self._max_memory_bytes:
+                self._worker_unavailable_error = (
+                    "RuntimeError: Sandbox worker was closed after exceeding the session memory limit"
+                )
+                self._close_worker()
+                return ExecutionResult(
+                    stdout=message["stdout"],
+                    error=(
+                        "MemoryError: Session memory limit exceeded: "
+                        f"{memory_bytes_used} > {self._max_memory_bytes}; worker state was discarded"
+                    ),
+                    variables=[],
+                    memory_bytes_used=memory_bytes_used,
+                )
+            return ExecutionResult(
+                stdout=message["stdout"],
+                error=message["error"],
+                variables=message["variables"],
+                final=message.get("final"),
+                memory_bytes_used=self.memory_bytes_used,
+            )
+
     def list_variables(self) -> list[str]:
-        return [
-            k for k in self._namespace
-            if not k.startswith("_") and k != "__builtins__"
-        ]
+        return list(self._last_variables)
+
+    @property
+    def memory_bytes_used(self) -> int:
+        return self._helper_memory_bytes_used + self._worker_memory_bytes_used
+
+    def _track_memory(self, value: int, from_bytes: bool = False) -> None:
+        size = value if from_bytes else value
+        if self.memory_bytes_used + size > self._max_memory_bytes:
+            raise MemoryError(
+                f"Session memory limit exceeded: {self.memory_bytes_used + size} > {self._max_memory_bytes}"
+            )
+        self._helper_memory_bytes_used += size
+
+    def close(self) -> None:
+        if not getattr(self, "_process", None):
+            return
+        with self._worker_lock:
+            self._close_worker()
+
+    def _close_worker(self, graceful: bool = True) -> None:
+        if self._parent_conn.closed:
+            return
+        try:
+            if graceful and self._process.is_alive():
+                send_message(self._parent_conn, {"type": "close"})
+                self._process.join(timeout=1)
+        except (EOFError, OSError):
+            pass
+        finally:
+            self._parent_conn.close()
+            if self._process.is_alive():
+                self._process.terminate()
+                self._process.join(timeout=1)
+            if self._process.is_alive():
+                self._process.kill()
+                self._process.join(timeout=1)
+            self._last_variables = []
+            self._worker_memory_bytes_used = 0
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

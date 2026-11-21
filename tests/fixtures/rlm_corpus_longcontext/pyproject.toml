@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shipstation"
+version = "2.4.1"
+description = "Order management and fulfillment platform"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "ShipStation Engineering", email = "eng@shipstation.dev" },
+]
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "sqlalchemy[asyncio]>=2.0.25",
+    "alembic>=1.13.1",
+    "redis>=5.0.1",
+    "stripe>=8.0.0",
+    "pydantic>=2.5.3",
+    "pyyaml>=6.0.1",
+    "httpx>=0.26.0",
+    "elasticsearch>=8.12.0",
+    "celery[redis]>=5.3.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "pytest-asyncio>=0.23", "coverage>=7.4"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

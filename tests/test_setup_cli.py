@@ -1,4 +1,9 @@
 import json
+import sys
+
+import pytest
+
+from rlm_tools import setup_cli
 
 from rlm_tools.setup_cli import (
     POLICY_END,
@@ -57,4 +62,40 @@ def test_upsert_policy_block_replaces_existing():
     assert updated.count(POLICY_START) == 1
     assert updated.count(POLICY_END) == 1
     assert "More content." in updated
+
+
+def test_print_only_does_not_install(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["rlm-tools-setup", "--print-json"])
+    monkeypatch.setattr(setup_cli, "detect_supported_clients", lambda: pytest.fail("install attempted"))
+    setup_cli.main()
+    assert '"mcpServers"' in capsys.readouterr().out
+
+
+def test_partial_install_failure_sets_exit_code_even_with_policy(monkeypatch, tmp_path):
+    path = tmp_path / "AGENTS.md"
+    monkeypatch.setattr(sys, "argv", ["rlm-tools-setup", "--write-policy", str(path)])
+    monkeypatch.setattr(setup_cli, "detect_supported_clients", lambda: ["claude", "codex"])
+    monkeypatch.setattr(setup_cli, "run_install", lambda client, dry_run: (client == "claude", client))
+    with pytest.raises(SystemExit) as error:
+        setup_cli.main()
+    assert error.value.code == 1
+    assert POLICY_START in path.read_text()
+
+
+def test_dry_run_preserves_existing_policy(monkeypatch, tmp_path):
+    path = tmp_path / "AGENTS.md"
+    path.write_text("Existing rules\n")
+    monkeypatch.setattr(sys, "argv", ["rlm-tools-setup", "--client", "codex", "--dry-run", "--write-policy", str(path)])
+    setup_cli.main()
+    assert path.read_text() == "Existing rules\n"
+
+
+@pytest.mark.parametrize("markers", [[POLICY_START], [POLICY_END, POLICY_START], [POLICY_START, POLICY_START, POLICY_END]])
+def test_malformed_policy_markers_preserve_file(tmp_path, markers):
+    path = tmp_path / "AGENTS.md"
+    original = "\nExisting instructions\n".join(markers)
+    path.write_text(original)
+    with pytest.raises(ValueError):
+        setup_cli.write_policy(path)
+    assert path.read_text() == original
 

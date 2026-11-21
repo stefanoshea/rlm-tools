@@ -1,4 +1,4 @@
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 from rlm_tools.llm_bridge import make_llm_query, make_llm_query_batched
 
 

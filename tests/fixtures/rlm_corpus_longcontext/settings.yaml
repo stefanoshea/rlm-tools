@@ -1,0 +1,48 @@
+stripe:
+  webhook_secret: "whsec_live_7kP9xM2nQ4rT8wL1"
+  api_version: "2024-01-15"
+  max_retries: 3
+  timeout_seconds: 30
+
+auth:
+  token_algorithm: "HS512"
+  token_issuer: "shipstation"
+  token_expiry_minutes: 30
+  refresh_token_days: 7
+  max_failed_attempts: 5
+
+database:
+  url: "postgresql://shipstation:secret@localhost:5432/shipstation"
+  pool_size: 20
+  max_overflow: 10
+  echo: false
+
+redis:
+  url: "redis://localhost:6379/0"
+  socket_timeout: 5
+
+cache:
+  default_ttl: 120
+  catalog_ttl: 300
+  session_ttl: 1800
+
+notifications:
+  channel_map:
+    order_confirmed: "email"
+    order_shipped: "sms"
+    refund_issued: "webhook"
+  retry_attempts: 3
+
+logging:
+  level: "INFO"
+  format: "json"
+
+feature_toggles:
+  enable_bulk_export: true
+  enable_advanced_search: false
+  enable_webhook_v2: true
+
+rate_limits:
+  api_requests_per_minute: 600
+  webhook_deliveries_per_minute: 120
+  export_jobs_per_hour: 10

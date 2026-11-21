@@ -11,3 +11,7 @@ evals/ab_results/
 docs/plans/
 .claude/
 .mcpregistry_*
+firebase-debug.log
+evals/specs/private/
+tests/private/
+.code-review-graph/
