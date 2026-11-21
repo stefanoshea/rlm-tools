@@ -1,0 +1,14 @@
+{
+  "name": "rlm-tools",
+  "owner": {
+    "name": "Stefan O'Shea"
+  },
+  "plugins": [
+    {
+      "name": "rlm-tools",
+      "source": "./plugins/rlm-tools",
+      "description": "Confined Python sandbox and recursive exploration tools for token-efficient codebase analysis",
+      "version": "0.1.3"
+    }
+  ]
+}

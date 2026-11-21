@@ -5,16 +5,18 @@ import itertools
 import json
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import anyio
 import pytest
+from mcp.client.stdio import get_default_environment
 from mcp.types import LATEST_PROTOCOL_VERSION
 
 
 @asynccontextmanager
-async def stdio_tools(workdir):
+async def stdio_tools(workdir, *, env=None):
     process = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "rlm_tools", cwd=workdir,
+        sys.executable, "-m", "rlm_tools", cwd=workdir, env=env,
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
     )
     ids = itertools.count(1)
@@ -52,6 +54,33 @@ async def stdio_tools(workdir):
             if process.returncode is None:
                 process.kill()
                 await process.wait()
+
+
+@pytest.mark.asyncio
+async def test_codex_plugin_opens_only_the_granted_workspace(tmp_path):
+    plugin = Path(__file__).resolve().parents[1] / "plugins" / "rlm-tools"
+    overlay = json.loads((plugin / ".codex-plugin" / "plugin.json").read_text())
+    workspace = tmp_path / "project with spaces"
+    workspace.mkdir()
+    (workspace / "marker.txt").write_text("workspace content")
+    sibling = tmp_path / "other-project"
+    sibling.mkdir()
+
+    client_env = {"RLM_ALLOWED_ROOTS": str(workspace)}
+    forwarded = overlay["mcpServers"]["rlm-tools"]["env_vars"]
+    server_env = get_default_environment()
+    server_env.update({key: client_env[key] for key in forwarded if key in client_env})
+    with anyio.fail_after(30):
+        async with stdio_tools(plugin, env=server_env) as call:
+            denied = await call("rlm_start", path=str(sibling), query="Open sibling")
+            assert "outside RLM_ALLOWED_ROOTS" in denied["error"]
+            started = await call("rlm_start", path=str(workspace), query="Read marker")
+            session = started["session_id"]
+            try:
+                read = await call("rlm_execute", session_id=session, code="print(read_file('marker.txt'))")
+                assert read == {"stdout": "workspace content\n", "error": None}
+            finally:
+                assert (await call("rlm_end", session_id=session))["success"]
 
 
 @pytest.mark.asyncio

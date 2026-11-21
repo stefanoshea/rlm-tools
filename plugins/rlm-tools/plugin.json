@@ -1,0 +1,30 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "rlm-tools",
+  "version": "0.1.3",
+  "description": "Confined Python sandbox and recursive exploration tools for token-efficient codebase analysis",
+  "author": {
+    "name": "Stefan O'Shea",
+    "url": "https://github.com/stefanoshea"
+  },
+  "homepage": "https://github.com/stefanoshea/rlm-tools",
+  "repository": "https://github.com/stefanoshea/rlm-tools",
+  "license": "MIT",
+  "keywords": [
+    "rlm",
+    "codebase-exploration",
+    "context-efficiency",
+    "sandbox",
+    "mcp"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "RLM Tools",
+        "shortDescription": "Confined Python sandbox for codebase exploration",
+        "longDescription": "Explore large codebases in an OS-confined Python sandbox with optional recursive sub-agent delegation while keeping raw file payloads out of context.",
+        "category": "Developer Tools"
+      }
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "rlm-tools": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["rlm-tools==0.1.3"]
+    }
+  }
+}

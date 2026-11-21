@@ -129,6 +129,35 @@ and pass both API keys, set `RLM_RECURSE_GATE=1`, and include the repository in 
 
 RLM Tools is a standard [MCP](https://modelcontextprotocol.io) server. It works with any MCP-compatible client: **Claude Code**, **Codex**, **Cursor**, and others.
 
+### Plugins & Extensions
+
+Install `rlm-tools` with its bundled `rlm-explore` skill (`SKILL.md`) via your client's plugin or extension manager:
+
+- **Claude Code:**
+  ```bash
+  /plugin marketplace add stefanoshea/rlm-tools
+  /plugin install rlm-tools@rlm-tools
+  ```
+- **Codex CLI** (Agent Plugins 1.0):
+  ```bash
+  codex plugin marketplace add stefanoshea/rlm-tools
+  codex plugin add rlm-tools@rlm-tools
+  ```
+  Then run this from the repository you want to explore each time you start Codex:
+  ```bash
+  RLM_ALLOWED_ROOTS="$(pwd -P)" codex --no-daemon
+  ```
+  Codex starts the bundled server in the plugin's installation directory. The plugin forwards the workspace grant from this Codex process, so `rlm_start` can open the selected repository and its descendants.
+- **Cursor, VS Code / GitHub Copilot, Amazon Kiro:** Install from `plugins/rlm-tools` (uses the Agent Plugins 1.0 manifest with bundled `SKILL.md` and `mcp.json`).
+- **Gemini CLI:**
+  ```bash
+  gemini extensions install https://github.com/stefanoshea/rlm-tools
+  ```
+  Restart Gemini and run `/skills list` to see `rlm-explore`.
+- **Standalone skill (`agentskills.io`):** `plugins/rlm-tools/skills/rlm-explore/SKILL.md` works with Windsurf, OpenCode, Cline, Zed, and other Agent Skills clients alongside standard MCP registration (`uvx rlm-tools`).
+
+Exploration is read-only. On clients that launch the portable MCP server from the plugin directory, configure `RLM_ALLOWED_ROOTS` in the server environment for the project you want to explore. External model helpers require a separate opt-in.
+
 ### Optional Strict Mode
 
 If your MCP client supports tool permissions or hooks, disable/block default read/grep/glob tools for repository exploration and keep `rlm-tools` enabled. This is the strongest way to force the token-efficient path.

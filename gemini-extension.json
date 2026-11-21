@@ -1,0 +1,11 @@
+{
+  "name": "rlm-tools",
+  "version": "0.1.3",
+  "description": "Confined Python sandbox and recursive exploration tools for token-efficient codebase analysis",
+  "mcpServers": {
+    "rlm-tools": {
+      "command": "uvx",
+      "args": ["rlm-tools==0.1.3"]
+    }
+  }
+}

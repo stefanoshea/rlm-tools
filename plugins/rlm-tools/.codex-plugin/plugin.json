@@ -1,0 +1,9 @@
+{
+  "name": "rlm-tools",
+  "mcpServers": {
+    "rlm-tools": {
+      "command": "uvx",
+      "env_vars": ["RLM_ALLOWED_ROOTS"]
+    }
+  }
+}
