@@ -1,5 +1,8 @@
 """Tests for the worker process resource-limit backstop (DoS mitigation)."""
 
+import subprocess
+import sys
+
 import pytest
 
 from rlm_tools.worker_runtime import apply_resource_limits
@@ -12,15 +15,20 @@ def _soft(limit_name: str) -> int:
 
 
 def test_applies_cpu_limit():
-    # RLIMIT_CPU is portable (incl. macOS) and reported back via getrlimit.
-    original = resource.getrlimit(resource.RLIMIT_CPU)
-    try:
-        applied = apply_resource_limits(max_address_space_bytes=None, cpu_seconds=3600)
-        expected = 3600 if original[1] == resource.RLIM_INFINITY else min(3600, original[1])
-        assert applied.get("RLIMIT_CPU") == expected
-        assert _soft("RLIMIT_CPU") == expected
-    finally:
-        resource.setrlimit(resource.RLIMIT_CPU, original)
+    # A reduced hard limit cannot be restored in the pytest process.
+    subprocess.run(
+        [sys.executable, "-c", """
+import resource
+from rlm_tools.worker_runtime import apply_resource_limits
+
+_, hard = resource.getrlimit(resource.RLIMIT_CPU)
+expected = 3600 if hard == resource.RLIM_INFINITY else min(3600, hard)
+assert apply_resource_limits(None, 3600)["RLIMIT_CPU"] == expected
+assert resource.getrlimit(resource.RLIMIT_CPU) == (expected, expected)
+"""],
+        check=True,
+        timeout=10,
+    )
 
 
 def test_none_values_are_noops():

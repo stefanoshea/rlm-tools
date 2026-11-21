@@ -3,12 +3,12 @@ import builtins
 import collections
 import contextlib
 import functools
+import importlib
 import io
 import signal
 import sys
 import threading
 from contextlib import contextmanager
-from multiprocessing.connection import Connection
 from types import (
     FunctionType,
     GetSetDescriptorType,
@@ -23,7 +23,8 @@ try:
 except ImportError:  # pragma: no cover - non-POSIX platforms
     resource = None
 
-from rlm_tools.worker_protocol import ExecuteResponse, receive_message, send_message
+from rlm_tools.worker_isolation import confine_worker
+from rlm_tools.worker_protocol import ExecuteResponse, WorkerChannel, receive_message, send_message
 
 
 ALLOWED_MODULES = frozenset({
@@ -133,7 +134,7 @@ def apply_resource_limits(
             target = value
             if hard != resource.RLIM_INFINITY:
                 target = min(value, hard)
-            resource.setrlimit(limit, (target, hard))
+            resource.setrlimit(limit, (target, target))
             applied[name] = target
         except (ValueError, OSError):
             continue
@@ -178,7 +179,7 @@ def _make_restricted_import(allowed: frozenset[str]):
 class HelperProxy:
     __slots__ = ("_conn", "_name")
 
-    def __init__(self, conn: Connection, name: str):
+    def __init__(self, conn: WorkerChannel, name: str):
         object.__setattr__(self, "_conn", conn)
         object.__setattr__(self, "_name", name)
 
@@ -227,7 +228,7 @@ class LocalTool:
 class WorkerRuntime:
     def __init__(
         self,
-        conn: Connection,
+        conn: WorkerChannel,
         max_output_chars: int,
         execution_timeout_seconds: int,
         max_memory_bytes: int,
@@ -439,23 +440,37 @@ class WorkerRuntime:
 
 
 def worker_main(
-    conn: Connection,
+    conn: WorkerChannel,
     max_output_chars: int,
     execution_timeout_seconds: int,
     max_memory_bytes: int,
     max_address_space_bytes: int | None = None,
     cpu_seconds: int | None = None,
+    *,
+    channel_fd: int,
 ) -> None:
-    apply_resource_limits(
-        max_address_space_bytes=max_address_space_bytes,
-        cpu_seconds=cpu_seconds,
-    )
-    runtime = WorkerRuntime(
-        conn=conn,
-        max_output_chars=max_output_chars,
-        execution_timeout_seconds=execution_timeout_seconds,
-        max_memory_bytes=max_memory_bytes,
-    )
+    try:
+        # Imports may need files on disk at startup. Load the allowed modules
+        # before confinement and before accepting any message from the parent.
+        for name in sorted(ALLOWED_MODULES):
+            importlib.import_module(name)
+        apply_resource_limits(
+            max_address_space_bytes=max_address_space_bytes,
+            cpu_seconds=cpu_seconds,
+        )
+        if resource is not None:
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        confine_worker(channel_fd)
+        runtime = WorkerRuntime(
+            conn=conn,
+            max_output_chars=max_output_chars,
+            execution_timeout_seconds=execution_timeout_seconds,
+            max_memory_bytes=max_memory_bytes,
+        )
+    except Exception as exc:
+        send_message(conn, {"type": "startup_error", "error": str(exc)})
+        return
+    send_message(conn, {"type": "ready"})
 
     while True:
         try:
@@ -482,9 +497,14 @@ def worker_main(
             try:
                 send_message(conn, response)
             except (TypeError, ValueError, RecursionError) as exc:
-                response["error"] = result.error or f"{type(exc).__name__}: {exc}"
-                response["final"] = None
-                send_message(conn, response)
+                send_message(conn, {
+                    "type": "execute_result",
+                    "stdout": "",
+                    "error": f"{type(exc).__name__}: {str(exc)[:1000]}",
+                    "variables": [],
+                    "final": None,
+                    "memory_bytes_used": result.memory_bytes_used,
+                })
             continue
 
         if kind == "close":

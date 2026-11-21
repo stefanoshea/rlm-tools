@@ -9,6 +9,7 @@ from time import perf_counter
 from typing import Any
 
 from evals.aggregate_benchmark import format_benchmark_summary
+from evals.artifacts import ensure_artifact_dir, open_raw_artifact, write_artifact
 from evals.grade_eval import load_eval_specs
 from evals.run_prompt_benchmark import judge_from_env, run_benchmark_from_results
 
@@ -27,7 +28,7 @@ def _run_claude(
     raw_path: Path,
 ) -> dict[str, Any]:
     config_path = workdir / ".mcp.json"
-    config_path.write_text(json.dumps(mcp_config), encoding="utf-8")
+    write_artifact(config_path, json.dumps(mcp_config))
     allowed_tools = tools or "mcp__rlm-tools__rlm_start,mcp__rlm-tools__rlm_execute,mcp__rlm-tools__rlm_end"
     command = [
         "claude", "--print", "--output-format", "json",
@@ -41,10 +42,24 @@ def _run_claude(
         command.extend(["--model", model])
 
     started = perf_counter()
-    with raw_path.open("w", encoding="utf-8") as stdout:
+    child_keys = {
+        "PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "XDG_CONFIG_HOME",
+        "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+    }
+    child_keys.update(key.strip() for key in env.get("RLM_AB_PASSTHROUGH_ENV", "").split(","))
+    child_env = {key: env[key] for key in child_keys if key in env}
+    child_env["RLM_RECURSE_GATE"] = "0"
+    if mcp_config.get("mcpServers") and env.get("RLM_AB_SEMANTIC") == "1":
+        child_env["RLM_RECURSE_GATE"] = "1"
+        for key in ("TYPESAFE_API_KEY", "TYPESAFE_DEFAULT_MODEL", "RLM_SUB_MODEL"):
+            if key in env:
+                child_env[key] = env[key]
+    with open_raw_artifact(raw_path) as stdout:
         process = subprocess.run(
             command, input=prompt, stdout=stdout, stderr=subprocess.PIPE,
-            cwd=workdir, env=env, encoding="utf-8",
+            cwd=workdir, env=child_env, encoding="utf-8",
         )
     elapsed_ms = (perf_counter() - started) * 1000
     if process.returncode:
@@ -116,6 +131,8 @@ def main() -> None:
     spec_path = Path(env.get("RLM_AB_SPEC_PATH", REPO_ROOT / "evals/specs/rlm_long_context.json")).resolve()
     if not target.is_dir() or not server_path.is_dir():
         raise SystemExit(f"Invalid target or server directory: {target}, {server_path}")
+    if os.pathsep in str(target):
+        raise SystemExit("The target path contains the root list separator.")
     try:
         specs = load_eval_specs(spec_path)
     except (OSError, ValueError, TypeError, KeyError) as exc:
@@ -123,10 +140,12 @@ def main() -> None:
     if not specs:
         raise SystemExit(f"Benchmark spec contains no cases: {spec_path}")
 
-    destination = REPO_ROOT / "evals" / "ab_results" / datetime.now().strftime("%Y%m%d_%H%M%S_%f_benchmark")
-    destination.mkdir(parents=True)
+    results_root = ensure_artifact_dir(REPO_ROOT / "evals" / "ab_results")
+    destination = ensure_artifact_dir(
+        results_root / datetime.now().strftime("%Y%m%d_%H%M%S_%f_benchmark"), exist_ok=False,
+    )
     archived_spec = destination / "benchmark_spec.json"
-    archived_spec.write_text(json.dumps({"evals": [case.to_dict() for case in specs]}, indent=2), encoding="utf-8")
+    write_artifact(archived_spec, json.dumps({"evals": [case.to_dict() for case in specs]}, indent=2))
     print(f"Writing benchmark artifacts to {destination}", flush=True)
     system_prompt = (
         "Answer only the question asked and follow its output format. "
@@ -136,9 +155,10 @@ def main() -> None:
     server_command = ["--directory", str(server_path), "run"]
     if use_gate:
         server_command.extend(["--extra", "semantic"])
+    server_env = {"RLM_ALLOWED_ROOTS": str(target), "RLM_EXTERNAL_ROOTS": str(target) if use_gate else ""}
     configs = {
         "with_rlm": ({"mcpServers": {"rlm-tools": {
-            "command": "uv", "args": [*server_command, "rlm-tools"],
+            "command": "uv", "args": [*server_command, "rlm-tools"], "env": server_env,
         }}}, ""),
         "without_rlm": ({"mcpServers": {}}, "Read,Grep,Glob"),
     }
@@ -148,7 +168,7 @@ def main() -> None:
     try:
         with TemporaryDirectory(prefix="rlm-ab-") as tmpdir:
             for name in configs:
-                (Path(tmpdir) / name).mkdir()
+                ensure_artifact_dir(Path(tmpdir) / name)
 
             for index, spec in enumerate(specs, start=1):
                 prompt = spec.prompt.replace("{target_path}", str(target))
@@ -171,10 +191,10 @@ def main() -> None:
         name: {eval_id: trials[0] if iterations == 1 else trials for eval_id, trials in by_eval.items()}
         for name, by_eval in trials_by_config.items()
     }
-    (destination / "raw_results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
+    write_artifact(destination / "raw_results.json", json.dumps(results, indent=2))
     summary = run_benchmark_from_results(archived_spec, destination, results, judge=judge_from_env())
     formatted = format_benchmark_summary(summary, claude_cli_tokens=True)
-    (destination / "benchmark_stdout.txt").write_text(formatted + "\n", encoding="utf-8")
+    write_artifact(destination / "benchmark_stdout.txt", formatted + "\n")
     print(formatted)
 
 

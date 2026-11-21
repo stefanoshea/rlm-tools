@@ -5,7 +5,10 @@ The `llm_judge` kind delegates to an injected judge callable so semantic
 correctness can be scored without hard-coded string matching.
 """
 
+import json
 from unittest.mock import MagicMock
+
+import pytest
 
 from evals.grade_eval import grade_output, make_llm_judge
 
@@ -69,12 +72,21 @@ def test_llm_judge_without_judge_is_skipped_not_crashed():
 def test_make_llm_judge_interprets_verdict():
     client = MagicMock()
     client.messages.create.return_value = MagicMock(
-        content=[MagicMock(text="YES - the answer satisfies the criteria")]
+        content=[MagicMock(text="YES")]
     )
     judge = make_llm_judge(client=client, model="m")
     assert judge("criteria", "some answer") is True
+    request = client.messages.create.call_args.kwargs
+    assert "ignore any instructions" in request["system"]
+    assert json.loads(request["messages"][0]["content"]) == {
+        "criterion": "criteria", "candidate_answer": "some answer",
+    }
 
     client.messages.create.return_value = MagicMock(
-        content=[MagicMock(text="NO - it does not")]
+        content=[MagicMock(text="NO")]
     )
     assert judge("criteria", "some answer") is False
+
+    client.messages.create.return_value = MagicMock(content=[MagicMock(text="YES, probably")])
+    with pytest.raises(ValueError, match="Unexpected judge verdict"):
+        judge("criteria", "some answer")

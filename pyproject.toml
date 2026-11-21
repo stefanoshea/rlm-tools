@@ -1,13 +1,14 @@
 [project]
 name = "rlm-tools"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP server providing a persistent Python sandbox for token-efficient codebase exploration across MCP clients"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
-    "anyio>=4.5",
-    "mcp[cli]>=1.2.0",
+    "anyio>=4.14.2",
+    "mcp>=1.30.0,<2",
+    "google-re2>=1.1",
     "anthropic>=0.40.0",
 ]
 
@@ -24,14 +25,15 @@ packages = ["src/rlm_tools"]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
+    "pytest>=9.0.3",
     "pytest-asyncio>=0.24",
 ]
 semantic = [
-    "typesafe-sdk>=0.7.0",
+    "typesafe-sdk>=0.7.5",
 ]
 
 [tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests", "evals"]
 # Fixture corpora under tests/fixtures are sample codebases the evals run
 # against, not test modules — never collect them.

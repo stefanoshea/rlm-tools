@@ -63,7 +63,7 @@ def test_server_shutdown_releases_open_sessions(tmp_path, monkeypatch):
     session_id = started["session_id"]
     worker = server._sandboxes[session_id]._process
     server.main()
-    assert not worker.is_alive()
+    assert worker.poll() is not None
     assert server.session_manager.get(session_id) is None
     assert not server._sandboxes
 
@@ -134,7 +134,7 @@ def test_worker_start_failure_releases_session_slot(tmp_path, monkeypatch):
     server._rlm_end(started["session_id"])
 
 
-def test_flat_query_retries_respect_session_budget(tmp_path, monkeypatch):
+def test_flat_query_retries_respect_session_budget(external_test_roots, tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     client = MagicMock()
     client.messages.create.side_effect = ConnectionError("provider unavailable")
@@ -155,7 +155,7 @@ def test_flat_query_retries_respect_session_budget(tmp_path, monkeypatch):
     client.messages.create.assert_called_once()
 
 
-def test_tool_install_failure_closes_the_worker(tmp_path):
+def test_tool_install_failure_closes_the_worker(external_test_roots, tmp_path):
     from rlm_tools import server
 
     with patch.object(server, "Sandbox") as make_sandbox, \
@@ -375,7 +375,7 @@ def test_memory_limit_counts_worker_namespace_allocations():
             _rlm_end(session_id)
 
 
-def test_recursive_helpers_and_finalize():
+def test_recursive_helpers_and_finalize(external_test_roots):
     # rlm_recurse wraps the recursive explorer; rlm_recurse_batched runs that
     # explorer once per prompt via the real batched wrapper (left unpatched).
     with tempfile.TemporaryDirectory() as tmpdir, \
@@ -410,11 +410,12 @@ def test_recursive_helpers_and_finalize():
             os.environ.pop("ANTHROPIC_API_KEY", None)
 
 
-def test_the_gate_is_built_when_a_typesafe_key_is_set(tmp_path, monkeypatch):
+def test_the_gate_can_be_enabled_with_a_typesafe_key(tmp_path, monkeypatch):
     """The gate is server-side only: it must never appear in the sandbox surface."""
     import rlm_tools.server as server_module
 
     monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
+    monkeypatch.setenv("RLM_RECURSE_GATE", "1")
     monkeypatch.setattr(server_module, "make_scorer", lambda **kwargs: (lambda items, q: []))
 
     gate = server_module._make_recurse_gate(session=None, reserve=lambda count: None)
@@ -444,19 +445,22 @@ def test_the_gate_can_be_switched_off(tmp_path, monkeypatch):
     assert server_module._make_recurse_gate(session=None) is None
 
 
-def test_scan_metadata_resolves_symlinked_root(tmp_path):
-    from rlm_tools.server import _scan_metadata
-
+def test_start_scans_metadata_for_authorized_symlinked_root(tmp_path):
     real_root = tmp_path / "real"
     real_root.mkdir()
     (real_root / "main.py").write_text("print('hi')\n")
     symlink_root = tmp_path / "link_root"
     symlink_root.symlink_to(real_root)
 
-    metadata = _scan_metadata(str(symlink_root))
-    assert metadata["total_files"] == 1
-    assert metadata["total_lines"] == 1
-    assert metadata["file_types"] == {".py": 1}
+    started = json.loads(_rlm_start(str(symlink_root), "query", include_metadata=True))
+    session_id = started["session_id"]
+    try:
+        metadata = started["metadata"]
+        assert metadata["total_files"] == 1
+        assert metadata["total_lines"] == 1
+        assert metadata["file_types"] == {".py": 1}
+    finally:
+        _rlm_end(session_id)
 
 
 def test_start_guidance_omits_unavailable_model_helpers(tmp_path, monkeypatch):

@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 import sys
 
 import pytest
@@ -98,4 +100,25 @@ def test_malformed_policy_markers_preserve_file(tmp_path, markers):
     with pytest.raises(ValueError):
         setup_cli.write_policy(path)
     assert path.read_text() == original
+
+
+def test_write_policy_rejects_symlink(tmp_path):
+    note = tmp_path / "notes.md"
+    note.write_text("Original notes\n")
+    policy = tmp_path / "AGENTS.md"
+    policy.symlink_to(note)
+    with pytest.raises(ValueError, match="regular file"):
+        setup_cli.write_policy(policy)
+    assert policy.is_symlink()
+    assert note.read_text() == "Original notes\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires POSIX permissions")
+def test_write_policy_preserves_file_mode(tmp_path):
+    policy = tmp_path / "AGENTS.md"
+    policy.write_text("Existing policy\n")
+    policy.chmod(0o640)
+    setup_cli.write_policy(policy)
+    assert stat.S_IMODE(policy.stat().st_mode) == 0o640
+    assert POLICY_START in policy.read_text()
 

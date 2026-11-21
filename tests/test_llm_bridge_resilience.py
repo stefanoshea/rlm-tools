@@ -1,12 +1,42 @@
 """Timeout, retry, and error-surfacing behavior for the sub-LLM bridge."""
 
+import time
 from unittest.mock import MagicMock, patch
 
 import httpx
-import pytest
 from anthropic import APIStatusError
 
-from rlm_tools.llm_bridge import make_llm_query, make_llm_query_batched
+import pytest
+
+from rlm_tools.llm_bridge import make_llm_query, make_llm_query_batched, make_recursive_query
+
+
+@pytest.mark.parametrize("factory", [make_llm_query, make_recursive_query])
+def test_provider_requests_stop_at_execution_deadline(factory):
+    client = MagicMock()
+    end = time.monotonic() + 3
+
+    def expired_on_response(**kwargs):
+        nonlocal end
+        assert 0 < kwargs["timeout"] <= 3
+        end = time.monotonic() - 1
+        raise ConnectionError("temporary failure")
+
+    client.messages.create.side_effect = expired_on_response
+    call = factory(client=client, deadline=lambda: end)
+    with pytest.raises(TimeoutError):
+        call("count the files")
+    assert client.messages.create.call_count == 1
+
+
+def test_scoring_deadline_precedes_provider_dispatch():
+    from rlm_tools.semantic import make_scorer
+
+    client = MagicMock()
+    scorer = make_scorer(client=client, deadline=lambda: time.monotonic() - 1)
+    with pytest.raises(TimeoutError):
+        scorer(["file excerpt"], "relevant?")
+    client.system_one.assert_not_called()
 
 
 def test_llm_query_passes_request_timeout():

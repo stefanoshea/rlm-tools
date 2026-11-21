@@ -4,7 +4,7 @@
 
 Large grep results and file reads can fill an AI coding agent's context window before it has answered the question.
 
-RLM Tools gives your agent a persistent sandbox to explore code in. Data stays server-side. Only the conclusions come back.
+RLM Tools gives your agent a persistent sandbox to explore code in. Local exploration keeps intermediate file reads and search results in the server process. The agent receives the output it asks for. Optional model helpers can send repository content to external providers.
 
 RLM Tools keeps raw context in tool-side memory and exposes a genuinely recursive explorer: `rlm_recurse` runs its own server-side tool-use loop (grep/read/glob/tree) and can spawn depth-limited child agents, so a sub-question is answered by exploring the corpus directly instead of dumping it into the root agent's context. Scored evals and prompt benchmarks measure answer quality alongside efficiency.
 
@@ -32,7 +32,7 @@ codex mcp add rlm-tools -- uvx rlm-tools
 
 **Without RLM Tools** — agent greps for `import UIKit`, gets 500 matches dumped into context. Reads 10 files, burns all their content as tokens. Context window fills up. Agent forgets what it was doing.
 
-**With RLM Tools** — agent runs the same exploration in a server-side Python sandbox. Data stays in sandbox memory. Only the `print()` output enters context:
+**With RLM Tools** — agent runs the same exploration in a server-side Python sandbox. In this example, only the printed summary enters the agent's context:
 
 ```python
 matches = grep("import UIKit")
@@ -103,7 +103,7 @@ Variables persist across `rlm_execute` calls within a session. The agent can bui
 ### Evidence Gate
 
 A `rlm_recurse` sub-agent re-sends every tool result on every turn of its loop, so a
-large file read is paid for once per remaining turn. With `TYPESAFE_API_KEY` set, each
+large file read is paid for once per remaining turn. When TypeSafe scoring is enabled, each
 result is scored in chunks before it joins that history and only the parts bearing on
 the question are kept:
 
@@ -123,8 +123,7 @@ relevance scores cannot tell the last one from noise.
 
 The gate uses [TypeSafe](https://typesafe.ai) System One models. To enable it, run
 the server with the semantic extra (`uvx --from 'rlm-tools[semantic]' rlm-tools`)
-and pass both `TYPESAFE_API_KEY` and `ANTHROPIC_API_KEY` to the server.
-`RLM_RECURSE_GATE=0` disables scoring.
+and pass both API keys, set `RLM_RECURSE_GATE=1`, and include the repository in `RLM_EXTERNAL_ROOTS`. TypeSafe receives the question and candidate excerpts, including excerpts the gate later drops.
 
 ## Works With
 
@@ -178,24 +177,33 @@ uv sync
 uv run rlm-tools
 ```
 
-Then point your MCP client to `command: uv`, `args: ["--directory", "/path/to/rlm-tools", "run", "rlm-tools"]`.
+Then point your MCP client to `command: uv`, `args: ["--directory", "/path/to/rlm-tools", "run", "rlm-tools"]`, and set `RLM_ALLOWED_ROOTS` to the checkout you want to explore.
 
 </details>
 
 ## Configuration
 
-Set optional variables in your MCP client's server environment. For a source checkout,
-you can also copy `.env.example` to `.env`, fill in the values you use, and launch
-with `uv run --env-file .env rlm-tools`.
+Set these variables in the MCP **server** environment and restart the server after changing them. By default, the server allows exploration underneath its launch directory. If a client launches it from your home directory or the filesystem root, configure an explicit workspace. Multiple roots use the platform path separator (`:` on macOS and Linux).
 
-The core exploration features (read, grep, glob, tree) require no API key. `llm_query()` and `rlm_recurse()` call the Anthropic API for semantic analysis within the sandbox. The evidence gate that filters what `rlm_recurse` keeps calls the TypeSafe API. Each is optional — set only the keys for the features you want.
+For example, this configuration permits local exploration of two repositories and enables Anthropic helpers only for the second, when the server also has an Anthropic key:
+
+```json
+{
+  "RLM_ALLOWED_ROOTS": "/work/private:/work/shareable",
+  "RLM_EXTERNAL_ROOTS": "/work/shareable"
+}
+```
+
+A grant covers the named directory and its descendants. Keep private repositories outside roots granted external processing. Anthropic receives the prompts, context, and tool results used by the model helpers. Enabling the optional TypeSafe gate also sends the question and candidate excerpts to TypeSafe. Ordinary read, grep, glob, and tree operations require no provider. Keep real credentials in your client's secret configuration or an environment file outside the explored checkout.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | — | Required for `llm_query()`/`rlm_recurse()` only. Uses Anthropic's API (Claude). |
-| `TYPESAFE_API_KEY` | — | Enables the `rlm_recurse()` evidence gate. Uses TypeSafe's API (Jev). |
+| `RLM_ALLOWED_ROOTS` | Server launch directory, except home or filesystem root | Absolute directories the operator permits sessions to explore. An explicitly empty list denies all roots. |
+| `RLM_EXTERNAL_ROOTS` | Empty | Subset of allowed directories eligible for external model helpers. |
+| `ANTHROPIC_API_KEY` | — | Enables Anthropic model helpers for external-enabled sessions. |
+| `TYPESAFE_API_KEY` | — | Credential for optional TypeSafe scoring. |
 | `TYPESAFE_DEFAULT_MODEL` | `jev-latest` | System One model used by the evidence gate |
-| `RLM_RECURSE_GATE` | `1` | Set to `0` to disable the evidence gate with a key present |
+| `RLM_RECURSE_GATE` | `0` | Set to `1` to enable TypeSafe scoring for external-enabled Anthropic sessions. |
 | `RLM_SUB_MODEL` | `claude-haiku-4-5-20251001` | Claude model used for `llm_query()`/`rlm_recurse()` |
 | `RLM_SUB_TIMEOUT_SECONDS` | `60` | Per-request timeout for sub-LLM calls |
 | `RLM_SUB_MAX_RETRIES` | `3` | Retry attempts for transient sub-LLM failures |
@@ -205,17 +213,13 @@ The core exploration features (read, grep, glob, tree) require no API key. `llm_
 
 ## Security
 
-The sandbox is read-only and restricted:
+The stdio server is designed for one local MCP client. It starts each Python worker with an empty environment, a private IPC socket, and isolated Python startup. macOS uses Seatbelt. Linux requires `libseccomp.so.2` and permits the system calls needed for computation and the private socket. Worker startup fails if the OS or launcher cannot apply the policy, including hosts that forbid nested macOS sandboxing. The trusted parent holds repository descriptors and provider credentials.
 
-- **Imports**: Sanitized proxies over safe stdlib modules only (`re`, `json`, `collections`, `math`, `fnmatch`, `itertools`, `functools`, `operator`, `string`, `textwrap`, `difflib`, `statistics`); relative imports, private `from ... import _name` imports, and leaked submodule attributes (such as `fnmatch.os` or `statistics.sys`) are blocked
-- **Builtins**: Provides a restricted `__import__` and blocks `exec`, `eval`, `compile`, `getattr`/`setattr`/`delattr`, `globals`/`locals`/`vars`, `dir`, `object`, `type`, `open`, `breakpoint`, interactive/help builtins (`help`, `license`, `credits`, `copyright`, `input`, `exit`, `quit`), and unallowlisted dunder builtins (such as `__loader__`, `__spec__`)
-- **Attribute access**: AST guard blocks private/dunder attribute access (`x.__class__`) and `match` class-pattern dunder access; runtime string-to-attribute resolvers are closed off too — `str.format`/`format_map` are blocked (use f-strings), and `operator.attrgetter`/`methodcaller`, `string.Formatter`, and `functools.update_wrapper`/`wraps` are stripped from the exposed module proxies since they bypass or sidestep the AST guard
-- **File access**: Read-only, scoped to session directory, path traversal blocked, and symlinks resolving outside the root are skipped by both `read_file` and `grep`
-- **File freshness**: Cached reads are keyed by mtime, so an edited file is re-read rather than served stale
-- **Execution**: On POSIX the worker has a configurable execution timeout (default 30s). A helper already running in the parent finishes before the timeout is reported. Model requests have their own timeout and retry settings. CPU and address-space limits depend on OS support.
-- **Rate limits**: Configurable max execute/LLM calls, memory, and output per session
-
-The implementation uses a worker-backed execution boundary (a separate spawned process) and hardened helper exposure. The exploration helpers themselves run in the trusted parent process, not the worker — `_resolve_safe` is the path boundary. This is safer than the original in-process version, but it should still be treated as a constrained execution environment, not a complete OS sandbox.
+- A session can open only an operator-approved directory. Helpers open paths relative to a retained directory descriptor, skip symlinks and multiply linked files, and read regular files only. They exclude Git metadata, local MCP configuration, registry token files, and `.env` variants except `.env.example`, `.env.sample`, and `.env.template`. Other files within the root can be returned to the agent.
+- Reads, batches, regex searches, directory scans, and IPC messages have size limits. A file read returns at most 4 MiB of source text plus a truncation marker. Grep uses RE2 syntax and a 1 MiB engine memory budget. For patterns that need Python lookaround or backreferences, apply the worker's `re` module to a bounded file read. Narrow the path or pattern when a search reports a limit. Metadata can include `truncated: true`.
+- Python imports expose selected public names from approved standard-library modules. Relative imports, private attributes, and wrapper helpers are restricted inside the OS-confined worker.
+- Workers enforce an execution timeout, restrict Python imports and builtins, and bound printed output. CPU and address-space backstops depend on OS support. Parent-side model requests use the remaining execution time for their network timeouts. An in-flight filesystem or network operation can still delay a response.
+- Model helpers are enabled per root. A local session never registers them, even when the server has provider credentials. Treat any root enabled for external processing as shareable with the selected providers.
 
 ## Background
 

@@ -2,6 +2,8 @@ import os
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable
+
 from anthropic import APIStatusError, Anthropic
 
 logger = logging.getLogger(__name__)
@@ -9,6 +11,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_MAX_RETRIES = 3
+
+
+def request_timeout(limit: float, deadline: Callable[[], float | None] | None) -> float:
+    end = deadline() if deadline is not None else None
+    if end is None:
+        return limit
+    remaining = end - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Execution deadline expired before provider request")
+    return min(limit, remaining)
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -54,6 +66,9 @@ def make_llm_query(
     timeout_seconds: float | None = None,
     max_retries: int | None = None,
     on_retry=None,
+    *,
+    system_prompt: str | None = None,
+    deadline: Callable[[], float | None] | None = None,
 ):
     _client = client or get_client()
     _model = model or os.environ.get("RLM_SUB_MODEL") or DEFAULT_MODEL
@@ -67,6 +82,7 @@ def make_llm_query(
         if max_retries is not None
         else int(os.environ.get("RLM_SUB_MAX_RETRIES", DEFAULT_MAX_RETRIES))
     )
+    request_options = {"system": system_prompt} if system_prompt is not None else {}
 
     def llm_query(prompt: str, context: str = "") -> str:
         if not prompt:
@@ -81,6 +97,7 @@ def make_llm_query(
         attempts = max(1, _max_retries)
         last_error: Exception | None = None
         for attempt in range(attempts):
+            timeout = request_timeout(_timeout, deadline)
             if attempt and on_retry is not None:
                 on_retry()
             try:
@@ -88,7 +105,8 @@ def make_llm_query(
                     model=_model,
                     max_tokens=1024,
                     messages=messages,
-                    timeout=_timeout,
+                    timeout=timeout,
+                    **request_options,
                 )
                 return _extract_text(response.content)
             except Exception as e:  # noqa: BLE001 - retried then re-raised below
@@ -99,7 +117,7 @@ def make_llm_query(
                     logger.warning(
                         "llm_query attempt %d/%d failed: %s", attempt + 1, attempts, e
                     )
-                    time.sleep(min(2 ** attempt * 0.5, 4.0))
+                    time.sleep(request_timeout(min(2 ** min(attempt, 3) * 0.5, 4.0), deadline))
         raise last_error
 
     return llm_query
@@ -176,6 +194,7 @@ def make_recursive_query(
     max_retries: int | None = None,
     on_model_call=None,
     gate=None,
+    deadline: Callable[[], float | None] | None = None,
 ):
     """Build a genuinely recursive explorer.
 
@@ -207,6 +226,7 @@ def make_recursive_query(
         attempts = max(1, _max_retries)
         last_error: Exception | None = None
         for attempt in range(attempts):
+            timeout = request_timeout(_timeout, deadline)
             if on_model_call is not None:
                 on_model_call()
             try:
@@ -215,14 +235,14 @@ def make_recursive_query(
                     max_tokens=2048,
                     messages=messages,
                     tools=tools,
-                    timeout=_timeout,
+                    timeout=timeout,
                 )
             except Exception as e:  # noqa: BLE001 - retried then re-raised
                 if not _is_retryable(e):
                     raise
                 last_error = e
                 if attempt < attempts - 1:
-                    time.sleep(min(2 ** attempt * 0.5, 4.0))
+                    time.sleep(request_timeout(min(2 ** min(attempt, 3) * 0.5, 4.0), deadline))
         raise last_error
 
     def _run_tool(name: str, args: dict, depth: int) -> str:
@@ -290,12 +310,17 @@ def make_recursive_query(
     return recursive_query
 
 
-def make_llm_query_batched(llm_query_fn, max_workers: int = 8):
+def make_llm_query_batched(llm_query_fn, max_workers: int = 8, *, on_batch=None):
     def llm_query_batched(prompts: list[str], context: str = "") -> list[str]:
         if isinstance(prompts, (str, bytes)):
             raise TypeError("prompts must be a sequence of strings, not a single string")
         if not prompts:
             return []
+
+        if len(prompts) > 64:
+            raise ValueError("A model batch accepts at most 64 prompts")
+        if on_batch is not None:
+            on_batch(len(prompts))
 
         results: dict[int, str] = {}
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
