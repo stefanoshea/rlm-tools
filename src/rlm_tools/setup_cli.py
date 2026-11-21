@@ -1,10 +1,13 @@
 import argparse
 import json
+import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 
 POLICY_START = "<!-- rlm-tools-policy:start -->"
@@ -93,9 +96,53 @@ def upsert_policy_block(existing_text: str) -> str:
 
 
 def write_policy(path: Path) -> None:
-    existing_text = path.read_text() if path.exists() else ""
+    try:
+        original = path.lstat()
+    except FileNotFoundError:
+        original = None
+
+    existing_text = ""
+    if original is not None:
+        if not stat.S_ISREG(original.st_mode):
+            raise ValueError("Policy path must be a regular file")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        with os.fdopen(os.open(path, flags), encoding="utf-8", newline="") as source:
+            if os.fstat(source.fileno()) != original:
+                raise ValueError("Policy file changed while being opened")
+            existing_text = source.read()
+
     updated_text = upsert_policy_block(existing_text)
-    path.write_text(updated_text)
+    if updated_text == existing_text:
+        return
+
+    temporary_path = None
+    try:
+        with NamedTemporaryFile(mode="w", encoding="utf-8", newline="", dir=path.parent,
+                                delete=False) as destination:
+            temporary_path = Path(destination.name)
+            destination.write(updated_text)
+        if original is not None:
+            temporary_path.chmod(original.st_mode & 0o777)
+        try:
+            current = path.lstat()
+        except FileNotFoundError:
+            current = None
+        if current is not None and original is not None:
+            # Reading the file may change its access time.
+            unchanged = (
+                os.path.samestat(current, original)
+                and current.st_mtime_ns == original.st_mtime_ns
+                and current.st_ctime_ns == original.st_ctime_ns
+            )
+        else:
+            unchanged = current is original
+        if not unchanged:
+            raise ValueError("Policy file changed during the update")
+        temporary_path.replace(path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def main() -> None:

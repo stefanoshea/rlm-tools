@@ -15,7 +15,17 @@ import pytest
 
 from evals.metrics import StepMetric, TaskMetric, Timer, format_comparison
 from evals.test_comparative import _baseline_grep, _baseline_read
+from rlm_tools.access_policy import workspace_policy
 from rlm_tools.server import rlm_end, rlm_execute, rlm_start
+
+
+@pytest.fixture(autouse=True)
+def allow_eval_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv("RLM_ALLOWED_ROOTS", str(tmp_path))
+    monkeypatch.delenv("RLM_EXTERNAL_ROOTS", raising=False)
+    workspace_policy.cache_clear()
+    yield
+    workspace_policy.cache_clear()
 
 
 def _record(metric: TaskMetric, name: str, args: dict, response: str, elapsed: float):

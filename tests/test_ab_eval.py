@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 import subprocess
 
 import pytest
@@ -21,6 +23,7 @@ def test_ab_eval_records_both_arms_with_identical_prompts(tmp_path, monkeypatch,
     monkeypatch.setenv("RLM_AB_SPEC_PATH", str(spec))
     monkeypatch.setenv("RLM_AB_TARGET_PATH", str(target))
     monkeypatch.setenv("RLM_AB_MODEL", "example-model")
+    monkeypatch.setenv("UNRELATED_TEST_TOKEN", "fixture-only")
     monkeypatch.setenv("RLM_AB_ITERATIONS", str(iterations))
     monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
@@ -32,11 +35,18 @@ def test_ab_eval_records_both_arms_with_identical_prompts(tmp_path, monkeypatch,
     def stub_claude(command, *, input, stdout, cwd, env, **kwargs):
         assert command[command.index("--model") + 1] == "example-model"
         assert command[command.index("--add-dir") + 1] == str(target)
-        assert ("TYPESAFE_API_KEY" in env) == use_gate
-        assert env["RLM_RECURSE_GATE"] == str(int(use_gate))
+        assert "UNRELATED_TEST_TOKEN" not in env
+        gate_active = use_gate and cwd.name == "with_rlm"
+        assert ("TYPESAFE_API_KEY" in env) == gate_active
+        assert env["RLM_RECURSE_GATE"] == str(int(gate_active))
         if cwd.name == "with_rlm":
             config = json.loads((cwd / ".mcp.json").read_text())
-            assert ("semantic" in config["mcpServers"]["rlm-tools"]["args"]) == use_gate
+            server = config["mcpServers"]["rlm-tools"]
+            assert ("semantic" in server["args"]) == use_gate
+            assert server["env"] == {
+                "RLM_ALLOWED_ROOTS": str(target),
+                "RLM_EXTERNAL_ROOTS": str(target) if use_gate else "",
+            }
         tools = command[command.index("--tools") + 1]
         calls.append((cwd.name, tools, input))
         json.dump({
@@ -84,6 +94,9 @@ def test_ab_eval_records_both_arms_with_identical_prompts(tmp_path, monkeypatch,
     assert "Benchmark Summary" in summary
     assert "CLI Tokens" in summary
     assert "separate model usage by MCP helpers and the optional judge" in summary
+    if os.name == "posix":
+        for path in [results, *results.rglob("*")]:
+            assert stat.S_IMODE(path.stat().st_mode) == (0o700 if path.is_dir() else 0o600)
 
 
 def test_missing_claude_usage_preserves_the_answer(tmp_path, monkeypatch):
@@ -119,6 +132,18 @@ def test_denied_benchmark_tool_invalidates_an_otherwise_successful_trial(tmp_pat
 def test_ab_eval_rejects_invalid_iteration_counts(monkeypatch, value):
     monkeypatch.setenv("RLM_AB_ITERATIONS", value)
     with pytest.raises(SystemExit, match="positive integer"):
+        run_ab_eval.main()
+
+
+def test_ab_eval_rejects_unrepresentable_target_root(tmp_path, monkeypatch):
+    target = tmp_path / f"target{os.pathsep}fixture"
+    target.mkdir()
+    monkeypatch.setenv("RLM_AB_TARGET_PATH", str(target))
+    monkeypatch.setenv("RLM_AB_ITERATIONS", "1")
+    monkeypatch.setenv("RLM_AB_SEMANTIC", "0")
+    monkeypatch.setattr(run_ab_eval.shutil, "which", lambda _: "/stub/claude")
+
+    with pytest.raises(SystemExit, match="root list separator"):
         run_ab_eval.main()
 
 

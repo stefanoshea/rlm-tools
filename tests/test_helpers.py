@@ -279,3 +279,141 @@ def test_grep_read_max_files():
         result = helpers["grep_read"]("def", max_files=2)
         assert len(result["files"]) == 2
         assert "more" in result["summary"]
+
+
+def test_helpers_keep_open_workspace_across_rename(tmp_path):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "notes.txt").write_text("original")
+    helpers, workspace = make_helpers(str(root))
+    try:
+        root.rename(tmp_path / "moved")
+        root.mkdir()
+        (root / "notes.txt").write_text("replacement")
+
+        assert helpers["read_file"]("notes.txt") == "original"
+        assert helpers["grep"]("original")[0]["file"] == "notes.txt"
+        assert helpers["glob_files"]("*.txt") == ["notes.txt"]
+    finally:
+        workspace.close()
+    with pytest.raises(OSError, match="closed"):
+        helpers["read_file"]("notes.txt")
+
+
+def test_helpers_omit_private_paths_and_keep_templates(tmp_path):
+    from rlm_tools.helpers import scan_metadata
+
+    (tmp_path / ".env").write_text("example")
+    (tmp_path / ".mcp.local.json").write_text("{}")
+    (tmp_path / ".env.example").write_text("example")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("example")
+    (tmp_path / "notes.txt").write_text("example")
+    helpers, _ = make_helpers(str(tmp_path))
+
+    with pytest.raises(PermissionError, match="private"):
+        helpers["read_file"](".env")
+    with pytest.raises(PermissionError, match="private"):
+        helpers["tree"](".git")
+    assert sorted(helpers["glob_files"]("*")) == [".env.example", "notes.txt"]
+    assert helpers["read_file"](".env.example") == "example"
+    assert scan_metadata(str(tmp_path.resolve()))["total_files"] == 1
+
+
+def test_helpers_skip_symbolic_links(tmp_path):
+    (tmp_path / "notes.txt").write_text("example")
+    (tmp_path / "alias.txt").symlink_to("notes.txt")
+    helpers, _ = make_helpers(str(tmp_path))
+
+    with pytest.raises(PermissionError, match="Symbolic links"):
+        helpers["read_file"]("alias.txt")
+    assert helpers["glob_files"]("*.txt") == ["notes.txt"]
+    assert [result["file"] for result in helpers["grep"]("example")] == ["notes.txt"]
+
+
+def test_read_limits_apply_to_default_reads_and_batches(tmp_path, monkeypatch):
+    from rlm_tools import helpers as helper_module
+
+    monkeypatch.setattr(helper_module, "MAX_FILE_BYTES", 40)
+    monkeypatch.setattr(helper_module, "MAX_BATCH_BYTES", 95)
+    for name in ("one", "two", "three"):
+        (tmp_path / name).write_text("é" * 30, encoding="utf-8")
+    helpers, _ = make_helpers(str(tmp_path))
+
+    content = helpers["read_file"]("one")
+    assert content == "é" * 20 + "\n... [read truncated]"
+    batch = helpers["read_files"](["one", "two", "three"])
+    assert batch["one"] == content
+    assert "three" not in batch
+    assert sum(len(k.encode()) + len(v.encode()) for k, v in batch.items()) <= 95
+
+
+def test_grep_ignores_incomplete_line_when_file_is_truncated(tmp_path, monkeypatch):
+    from rlm_tools import helpers as helper_module
+
+    monkeypatch.setattr(helper_module, "MAX_FILE_BYTES", 10)
+    (tmp_path / "notes.txt").write_text("match\nmatching")
+    helpers, _ = make_helpers(str(tmp_path))
+
+    pattern = r"^match$|^matc$"
+    with pytest.raises(RuntimeError, match="scan truncated"):
+        helpers["grep"](pattern)
+    summary = helpers["grep_summary"](pattern)
+    assert "L1: match" in summary
+    assert "L2:" not in summary
+    assert "scan truncated" in summary
+    assert helpers["grep_summary"]("absent") == "[scan truncated: workspace limit reached]"
+    assert "scan truncated" in helpers["grep_read"]("absent")["summary"]
+
+
+def test_grep_rejects_unsupported_pattern_without_a_fallback(tmp_path):
+    (tmp_path / "notes.txt").write_text("project notes")
+    helpers, workspace = make_helpers(str(tmp_path))
+    try:
+        with pytest.raises(ValueError, match="unsupported RE2 pattern"):
+            helpers["grep"]("project(?= notes)")
+        assert helpers["grep"]("(?i)NOTES")[0]["line"] == "project notes"
+    finally:
+        workspace.close()
+
+
+def test_metadata_marks_bounded_line_counts(tmp_path, monkeypatch):
+    from rlm_tools import helpers as helper_module
+
+    monkeypatch.setattr(helper_module, "MAX_FILE_BYTES", 5)
+    (tmp_path / "notes.txt").write_text("line\nnext\n")
+    metadata = helper_module.scan_metadata(str(tmp_path.resolve()))
+
+    assert metadata["total_files"] == 1
+    assert metadata["total_lines"] == 1
+    assert metadata["truncated"] is True
+
+
+def test_helpers_skip_regular_files_with_multiple_hard_links(tmp_path):
+    from rlm_tools.helpers import scan_metadata
+
+    (tmp_path / "draft.txt").write_text("example")
+    os.link(tmp_path / "draft.txt", tmp_path / "draft-copy.txt")
+    helpers, _ = make_helpers(str(tmp_path))
+
+    with pytest.raises(PermissionError, match="multiple hard links"):
+        helpers["read_file"]("draft.txt")
+    assert helpers["grep"]("example") == []
+    assert helpers["glob_files"]("*.txt") == []
+    assert scan_metadata(str(tmp_path.resolve()))["total_files"] == 0
+
+
+def test_automatic_result_limit_reports_truncation(tmp_path, monkeypatch):
+    from rlm_tools import helpers as helper_module
+
+    monkeypatch.setattr(helper_module, "MAX_RESULTS", 2)
+    for name in ("one", "two", "three"):
+        (tmp_path / name).write_text("example")
+    helpers, _ = make_helpers(str(tmp_path))
+
+    assert len(helpers["grep"]("example", max_matches=2)) == 2
+    with pytest.raises(RuntimeError, match="scan truncated"):
+        helpers["grep"]("example")
+    with pytest.raises(RuntimeError, match="scan truncated"):
+        helpers["glob_files"]("*")
+    assert "scan truncated" in helpers["tree"]()

@@ -22,6 +22,8 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Protocol
 
+from rlm_tools.llm_bridge import request_timeout
+
 DEFAULT_MODEL = "jev-latest"
 DEFAULT_CHUNK_SIZE = 12
 DEFAULT_MAX_WORKERS = 4
@@ -39,11 +41,11 @@ EXHAUSTIVE_QUESTION = re.compile(
 
 
 class SystemOneClient(Protocol):
-    def system_one(self, state: Any, questions: dict[str, Any]) -> Any: ...
+    def system_one(self, state: Any, questions: dict[str, Any], **kwargs: Any) -> Any: ...
 
 
 def get_client(api_key: str | None = None, model: str | None = None) -> SystemOneClient:
-    from typesafe_sdk import TypeSafeClient
+    from typesafe_sdk import RetryPolicy, TypeSafeClient
 
     key = api_key or os.environ.get("TYPESAFE_API_KEY")
     if not key:
@@ -52,6 +54,7 @@ def get_client(api_key: str | None = None, model: str | None = None) -> SystemOn
         )
     return TypeSafeClient(
         api_key=key,
+        retry=RetryPolicy(max_retries=0),
         model=model or os.environ.get("TYPESAFE_DEFAULT_MODEL", DEFAULT_MODEL),
     )
 
@@ -74,6 +77,7 @@ def make_scorer(
     max_workers: int = DEFAULT_MAX_WORKERS,
     max_item_chars: int = DEFAULT_MAX_ITEM_CHARS,
     reserve: Callable[[int], None] | None = None,
+    deadline: Callable[[], float | None] | None = None,
 ) -> Callable[[list[str], str], list[float]]:
     """Build the batched relevance scorer.
 
@@ -90,6 +94,7 @@ def make_scorer(
         texts = [str(item)[:max_item_chars] for item in items]
 
         def _score_chunk(indexes: list[int]) -> dict[int, float]:
+            options = {} if deadline is None else {"timeout": request_timeout(60.0, deadline)}
             if reserve is not None:
                 reserve(1)
             response = _client.system_one(
@@ -101,6 +106,7 @@ def make_scorer(
                     f"c{i}": _noul(f"Is the criterion true of candidate {i}?")
                     for i in indexes
                 },
+                **options,
             )
             return {i: float(response.nouls[f"c{i}"].noul) for i in indexes}
 

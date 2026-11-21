@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -67,6 +69,29 @@ def test_missing_usage_cannot_win_an_efficiency_tie(tmp_path, comparison_spec):
     formatted = format_benchmark_summary(summary)
     assert "No preferred config (incomplete mean tokens data)." in formatted
     assert "- Tokens: N/A" in formatted
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires POSIX permissions")
+def test_benchmark_creates_private_artifacts(tmp_path, comparison_spec):
+    output = tmp_path / "runs"
+    run_benchmark_from_results(comparison_spec, output, {"with_rlm": {"one": {"output": "correct"}}})
+
+    for path in [output, *output.rglob("*")]:
+        assert stat.S_IMODE(path.stat().st_mode) == (0o700 if path.is_dir() else 0o600)
+
+
+def test_benchmark_rejects_symlinked_run_directory(tmp_path, comparison_spec):
+    case = tmp_path / "runs" / "with_rlm" / "one"
+    case.mkdir(parents=True)
+    alternate = tmp_path / "alternate"
+    alternate.mkdir()
+    (case / "run_001").symlink_to(alternate, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="Benchmark artifact directory"):
+        run_benchmark_from_results(
+            comparison_spec, tmp_path / "runs", {"with_rlm": {"one": {"output": "correct"}}},
+        )
+    assert not list(alternate.iterdir())
 
 
 @pytest.mark.parametrize("coverage", ["mismatched cases", "mismatched trials", "missing shared case"])

@@ -6,7 +6,7 @@ from unittest.mock import patch
 from rlm_tools.server import _rlm_end, _rlm_execute, _rlm_start
 
 
-def test_rlm_recurse_uses_named_context_variable():
+def test_rlm_recurse_uses_named_context_variable(external_test_roots):
     # rlm_recurse is now a recursive explorer; verify the prompt and the named
     # context variable are threaded through to it and the result is finalizable.
     with tempfile.TemporaryDirectory() as tmpdir, \

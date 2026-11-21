@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import pathlib
 import threading
 from typing import Annotated, Literal
 from weakref import WeakValueDictionary
@@ -10,7 +9,8 @@ from anyio import Lock, to_thread
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-from rlm_tools.helpers import _BINARY_EXTENSIONS, _walk_files
+from rlm_tools.access_policy import workspace_policy
+from rlm_tools.helpers import scan_metadata as _scan_metadata
 from rlm_tools.session import Session, SessionManager
 from rlm_tools.sandbox import Sandbox
 from rlm_tools.llm_bridge import (
@@ -32,48 +32,6 @@ session_manager = SessionManager(
 
 _sandboxes: dict[str, Sandbox] = {}
 _mcp_session_locks: WeakValueDictionary[str, Lock] = WeakValueDictionary()
-
-
-def _scan_metadata(path: str) -> dict:
-    root = pathlib.Path(path)
-    extensions: dict[str, int] = {}
-    total_files = 0
-    total_lines = 0
-    sampled_lines = 0
-    sampled_files = 0
-    sample_budget = 500
-
-    for file_path in _walk_files(root):
-        try:
-            target = file_path.resolve()
-            if not target.is_relative_to(root) or not target.is_file():
-                continue
-        except (OSError, RuntimeError):
-            continue
-
-        ext = file_path.suffix or "(no ext)"
-        extensions[ext] = extensions.get(ext, 0) + 1
-        total_files += 1
-
-        if ext.lower() not in _BINARY_EXTENSIONS:
-            try:
-                with target.open(errors="replace") as f:
-                    file_line_count = sum(1 for _ in f)
-                total_lines += file_line_count
-
-                if sampled_files < sample_budget:
-                    sampled_lines += file_line_count
-                    sampled_files += 1
-            except OSError:
-                pass
-
-    return {
-        "total_files": total_files,
-        "total_lines": total_lines,
-        "sampled_lines": sampled_lines,
-        "sampled_files": sampled_files,
-        "file_types": dict(sorted(extensions.items(), key=lambda x: -x[1])[:10]),
-    }
 
 
 def _cleanup_expired_resources() -> None:
@@ -102,42 +60,35 @@ def _make_call_reserver(session):
     return reserve
 
 
-def _make_recurse_gate(session, reserve=None):
-    """The evidence gate for rlm_recurse, when a TypeSafe key is present.
-
-    Off without the key, or with RLM_RECURSE_GATE=0. Independent of the
-    Anthropic key in configuration, though only rlm_recurse consumes it.
-    """
-    if not os.environ.get("TYPESAFE_API_KEY") or os.environ.get("RLM_RECURSE_GATE", "1") == "0":
+def _make_recurse_gate(session, reserve=None, deadline=None):
+    """Build the optional TypeSafe scoring gate for an external-enabled session."""
+    if not os.environ.get("TYPESAFE_API_KEY") or os.environ.get("RLM_RECURSE_GATE") != "1":
         return None
 
     try:
-        scorer = make_scorer(reserve=reserve or _make_call_reserver(session))
+        scorer = make_scorer(reserve=reserve or _make_call_reserver(session), deadline=deadline)
         return make_evidence_gate(scorer)
     except Exception as e:
         logger.warning(f"Could not initialize the evidence gate: {e}")
         return None
 
 
-def _install_session_llm_tools(session, sandbox: Sandbox, reserve=None, gate=None) -> bool:
+def _install_session_llm_tools(session, sandbox: Sandbox) -> bool:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return False
 
     try:
-        _reserve_llm_calls = reserve or _make_call_reserver(session)
-        base_llm_query = make_llm_query(on_retry=lambda: _reserve_llm_calls(1))
-        base_llm_query_batched = make_llm_query_batched(base_llm_query)
+        _reserve_llm_calls = _make_call_reserver(session)
+        gate = _make_recurse_gate(session, reserve=_reserve_llm_calls, deadline=sandbox.execution_deadline)
+        base_llm_query = make_llm_query(
+            on_retry=lambda: _reserve_llm_calls(1), deadline=sandbox.execution_deadline,
+        )
+        llm_query_batched = make_llm_query_batched(base_llm_query, on_batch=_reserve_llm_calls)
 
         def llm_query(prompt: str, context: str = "") -> str:
             _reserve_llm_calls(1)
             return base_llm_query(prompt, context)
-
-        def llm_query_batched(prompts: list[str], context: str = "") -> list[str]:
-            if not prompts:
-                return []
-            _reserve_llm_calls(len(prompts))
-            return base_llm_query_batched(prompts, context)
 
         # rlm_recurse is a true recursive explorer: it runs its own tool-use loop
         # server-side and may spawn depth-limited child agents. Every model turn
@@ -147,6 +98,7 @@ def _install_session_llm_tools(session, sandbox: Sandbox, reserve=None, gate=Non
             max_depth=int(os.environ.get("RLM_RECURSE_MAX_DEPTH", "2")),
             on_model_call=lambda: _reserve_llm_calls(1),
             gate=gate,
+            deadline=sandbox.execution_deadline,
         )
         recursive_query_batched = make_llm_query_batched(recursive_query)
     except Exception as e:
@@ -173,13 +125,15 @@ def _rlm_start(
 ) -> str:
     _cleanup_expired_resources()
 
-    resolved = str(pathlib.Path(path).resolve())
-    if not os.path.isdir(resolved):
-        return json.dumps({"error": f"Directory not found: {path}"})
+    try:
+        policy = workspace_policy()
+        root = policy.authorize(path)
+    except (OSError, ValueError, RuntimeError) as exc:
+        return json.dumps({"error": str(exc)})
 
     try:
         session_id = session_manager.create(
-            path=resolved,
+            path=str(root),
             query=query,
             max_output_chars=max_output_chars,
             max_llm_calls=max_llm_calls,
@@ -195,7 +149,10 @@ def _rlm_start(
         return json.dumps({"error": f"Failed to create session for path: {path}"})
 
     try:
-        return _initialize_session(session, execution_timeout_seconds, include_guidance, include_metadata)
+        return _initialize_session(
+            session, execution_timeout_seconds, include_guidance, include_metadata,
+            allow_external=policy.allows_external(root),
+        )
     finally:
         session_manager.release(session)
 
@@ -205,6 +162,8 @@ def _initialize_session(
     execution_timeout_seconds: int,
     include_guidance: bool,
     include_metadata: bool,
+    *,
+    allow_external: bool,
 ) -> str:
     session_id = session.session_id
     resolved = session.path
@@ -215,17 +174,12 @@ def _initialize_session(
         metadata = _scan_metadata(resolved) if include_metadata else {}
         sandbox = Sandbox(
             base_path=resolved,
+            base_is_canonical=True,
             max_output_chars=max_output_chars,
             execution_timeout_seconds=execution_timeout_seconds,
             max_memory_bytes=max_memory_bytes,
         )
-        reserve_model_call = _make_call_reserver(session)
-        has_llm_tools = _install_session_llm_tools(
-            session,
-            sandbox,
-            reserve=reserve_model_call,
-            gate=_make_recurse_gate(session, reserve=reserve_model_call),
-        )
+        has_llm_tools = allow_external and _install_session_llm_tools(session, sandbox)
     except Exception as e:
         session_manager.end(session_id)
         logger.exception("Failed to initialize session for %s", resolved)
@@ -441,6 +395,7 @@ async def rlm_end(
 
 
 def main():
+    workspace_policy()
     try:
         mcp.run(transport="stdio")
     finally:

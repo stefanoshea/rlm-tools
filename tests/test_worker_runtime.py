@@ -85,8 +85,8 @@ def test_stopped_worker_reports_unavailability(tmp_path):
     sandbox = Sandbox(base_path=str(tmp_path))
     try:
         sandbox._process.terminate()
-        sandbox._process.join(timeout=5)
-        assert not sandbox._process.is_alive()
+        sandbox._process.wait(timeout=5)
+        assert sandbox._process.poll() is not None
         assert "worker is unavailable" in sandbox.execute("print('hello')").error
     finally:
         sandbox.close()
@@ -113,7 +113,7 @@ def test_over_limit_final_value_is_discarded(tmp_path):
 
         assert "worker state was discarded" in result.error
         assert result.final is None
-        assert not sandbox._process.is_alive()
+        assert sandbox._process.poll() is not None
     finally:
         sandbox.close()
 
@@ -137,7 +137,7 @@ def test_missing_worker_response_closes_worker(tmp_path, monkeypatch):
         result = sandbox.execute("print('hello')")
 
         assert result.error.startswith("TimeoutError:")
-        assert not sandbox._process.is_alive()
+        assert sandbox._process.poll() is not None
         assert "closed after an execution timeout" in sandbox.execute("print(1)").error
     finally:
         sandbox.close()

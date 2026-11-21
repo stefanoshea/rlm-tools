@@ -92,7 +92,7 @@ For a two-question live smoke run against the smaller Python and TypeScript fixt
 RLM_AB_TARGET_PATH=tests/fixtures ./evals/run_ab_eval.sh evals/specs/rlm_core.json
 ```
 
-Each benchmark run gets a timestamped directory under `evals/ab_results`. It contains:
+Each benchmark run gets an owner-only, timestamped directory under `evals/ab_results`. It contains:
 
 - `output.json`
 - `timing.json`
@@ -108,7 +108,8 @@ Optional env vars for A/B script:
 - `RLM_AB_SPEC_PATH` (default: `evals/specs/rlm_long_context.json`)
 - `RLM_AB_MODEL` (optional: pin the same model for both arms, e.g. `claude-sonnet-4-6`)
 - `RLM_AB_ITERATIONS` sets the number of paired trials per question (default 1). With 11 questions, three iterations run 66 Claude CLI invocations.
-- `RLM_JUDGE=1` (optional: enable semantic `llm_judge` grading; also requires `ANTHROPIC_API_KEY`)
+- `RLM_JUDGE=1` (optional: record advisory `llm_judge` verdicts alongside deterministic scores; also requires `ANTHROPIC_API_KEY`)
+- `RLM_AB_PASSTHROUGH_ENV` lists additional environment variable names, separated by commas, to pass to the Claude CLI if your authentication or proxy setup requires them. Both arms receive those variables.
 - `RLM_AB_SEMANTIC=1` enables the semantic extra for the MCP server. The evidence gate for `rlm_recurse` requires both `TYPESAFE_API_KEY` and `ANTHROPIC_API_KEY`.
 
 ## Spend Policy
@@ -170,8 +171,7 @@ raw usage record to establish token counts for those runs.
 Expect the win to vary sharply by task type — broad reduce/aggregate questions should save
 the most, while single-grep lookups may show little or negative savings due to session
 overhead. For a custom spec with `llm_judge` assertions, set `RLM_JUDGE=1` and
-`ANTHROPIC_API_KEY` to include them in the score. Without a judge, the score
-uses the available deterministic assertions.
+`ANTHROPIC_API_KEY` to record advisory verdicts. Each scored case requires at least one deterministic assertion; those assertions determine its score.
 
 A good private spec mixes question shapes: a few single-hop lookups, a few multi-hop
 traces, and at least one open-ended reduce question. Give each entry grep-verifiable
