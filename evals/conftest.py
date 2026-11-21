@@ -49,12 +49,20 @@ def fixture_root():
 
 @pytest.fixture(scope="session")
 def sandbox():
-    return Sandbox(base_path=str(DEFAULT_PY_CORPUS_PATH), max_output_chars=50_000)
+    sb = Sandbox(base_path=str(DEFAULT_PY_CORPUS_PATH), max_output_chars=50_000)
+    try:
+        yield sb
+    finally:
+        sb.close()
 
 
 @pytest.fixture(scope="session")
 def ts_sandbox():
-    return Sandbox(base_path=str(DEFAULT_TS_CORPUS_PATH), max_output_chars=50_000)
+    sb = Sandbox(base_path=str(DEFAULT_TS_CORPUS_PATH), max_output_chars=50_000)
+    try:
+        yield sb
+    finally:
+        sb.close()
 
 
 @pytest.fixture(scope="session")

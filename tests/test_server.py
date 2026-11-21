@@ -442,3 +442,29 @@ def test_the_gate_can_be_switched_off(tmp_path, monkeypatch):
     monkeypatch.setenv("RLM_RECURSE_GATE", "0")
 
     assert server_module._make_recurse_gate(session=None) is None
+
+
+def test_scan_metadata_resolves_symlinked_root(tmp_path):
+    from rlm_tools.server import _scan_metadata
+
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    (real_root / "main.py").write_text("print('hi')\n")
+    symlink_root = tmp_path / "link_root"
+    symlink_root.symlink_to(real_root)
+
+    metadata = _scan_metadata(str(symlink_root))
+    assert metadata["total_files"] == 1
+    assert metadata["total_lines"] == 1
+    assert metadata["file_types"] == {".py": 1}
+
+
+def test_start_guidance_omits_unavailable_model_helpers(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    data = json.loads(_rlm_start(str(tmp_path), "query", include_guidance=True))
+    try:
+        assert "rlm_finalize" in data["strategy"]
+        assert "rlm_recurse" not in data["strategy"]
+        assert "llm_query" not in data["strategy"]
+    finally:
+        _rlm_end(data["session_id"])

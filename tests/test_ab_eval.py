@@ -132,3 +132,14 @@ def test_failed_claude_invocation_is_not_scored(tmp_path, monkeypatch):
             "prompt", tmp_path, tmp_path, {}, "Read", "system prompt", {},
             tmp_path / "raw.json",
         )
+
+
+@pytest.mark.parametrize("denials", [None, {"tool_name": "Read"}, [{"tool_name": []}]])
+def test_malformed_permission_report_invalidates_trial(tmp_path, monkeypatch, denials):
+    def stub_claude(command, *, stdout, **kwargs):
+        json.dump({"result": "example", "permission_denials": denials}, stdout)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(run_ab_eval.subprocess, "run", stub_claude)
+    with pytest.raises(ValueError, match="Invalid permission_denials"):
+        run_ab_eval._run_claude("prompt", tmp_path, tmp_path, {}, "Read", "system", {}, tmp_path / "raw.json")

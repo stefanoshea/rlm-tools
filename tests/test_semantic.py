@@ -4,7 +4,7 @@ inject a fake System One client so the suite stays offline."""
 
 from dataclasses import dataclass
 
-from rlm_tools.semantic import make_scorer
+from rlm_tools.semantic import make_evidence_gate, make_scorer
 
 
 @dataclass
@@ -86,3 +86,17 @@ def test_empty_input_costs_nothing():
 
     assert make_scorer(client=client)([], "relevant") == []
     assert client.calls == []
+
+
+def test_boolean_client_scores_fail_open_before_conversion(monkeypatch):
+    client = FakeClient()
+    monkeypatch.setattr(
+        client, "system_one", lambda *_: FakeResponse({"c0": FakeNoul(True), "c1": FakeNoul(False)})
+    )
+    records = []
+    gate = make_evidence_gate(
+        make_scorer(client=client), chunk_lines=1, min_chars=0, on_gate=records.append
+    )
+    text = "alpha\nbeta"
+    assert gate("what is relevant?", text) == text
+    assert records[0]["outcome"] == "failed_open"

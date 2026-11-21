@@ -51,13 +51,18 @@ def _run_claude(
         raise ValueError(f"{raw_path.name}: Claude exited with status {process.returncode}: {process.stderr.strip()}")
 
     result = json.loads(raw_path.read_text(encoding="utf-8"))
+    if not isinstance(result, dict):
+        raise ValueError(f"{raw_path.name}: Claude output must be a JSON object")
     if result.get("is_error") or not isinstance(result.get("result"), str):
         raise ValueError(f"{raw_path.name}: Claude did not return a successful text result")
     required_tools = set(allowed_tools.split(","))
-    denied = {
-        event["tool_name"] for event in result.get("permission_denials", [])
-        if event.get("tool_name") in required_tools
-    }
+    denials = result.get("permission_denials", [])
+    if not isinstance(denials, list) or any(
+        not isinstance(event, dict) or not isinstance(event.get("tool_name"), str)
+        for event in denials
+    ):
+        raise ValueError(f"{raw_path.name}: Invalid permission_denials in Claude output")
+    denied = {event["tool_name"] for event in denials} & required_tools
     if denied:
         raise ValueError(f"{raw_path.name}: benchmark tool access denied: {', '.join(sorted(denied))}")
     usage = result.get("usage")

@@ -14,19 +14,23 @@ _SKIP_DIRS = {
 }
 
 _BINARY_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".tar", ".gz",
-    ".xz", ".bz2", ".o", ".a", ".dylib", ".framework", ".xcassets",
-    ".car", ".nib", ".storyboardc", ".momd", ".sqlite", ".db",
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".avif",
+    ".pdf", ".zip", ".tar", ".gz", ".xz", ".bz2", ".whl",
+    ".o", ".a", ".so", ".dylib", ".dll", ".exe", ".bin", ".wasm",
+    ".pyc", ".pyo", ".framework", ".xcassets", ".car", ".nib",
+    ".storyboardc", ".momd", ".sqlite", ".db",
+    ".ttf", ".otf", ".woff", ".woff2",
+    ".mp3", ".mp4", ".mov", ".wav",
 }
 
 
 def _walk_files(root: pathlib.Path):
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [
+        dirnames[:] = sorted(
             d for d in dirnames
             if d not in _SKIP_DIRS and not d.startswith(".")
-        ]
-        for fname in filenames:
+        )
+        for fname in sorted(filenames):
             if fname.startswith("."):
                 continue
             yield pathlib.Path(dirpath) / fname
@@ -71,7 +75,7 @@ def make_helpers(
             if cache_hit:
                 content = cached[1]
             else:
-                with target.open(errors="replace") as file:
+                with target.open(encoding="utf-8", errors="replace") as file:
                     content = file.read() if max_bytes_read is None else file.read(max_bytes_read + 1)
 
             if max_bytes_read is not None:
@@ -87,6 +91,8 @@ def make_helpers(
 
     def read_files(paths: list[str], max_bytes_read: int | None = None) -> dict[str, str]:
         """Read multiple files at once. Returns {path: content} dict."""
+        if isinstance(paths, (str, bytes)):
+            raise TypeError("paths must be a list of file paths, not a single string")
         result = {}
         for path in paths:
             try:
@@ -108,22 +114,25 @@ def make_helpers(
         else:
             search_paths = _walk_files(target)
 
+        seen_targets: set[pathlib.Path] = set()
         for file_path in search_paths:
-            if not file_path.is_file():
-                continue
-            # Skip symlinks (or any path) that resolve outside the sandbox root.
-            if not _within_base(file_path):
-                continue
-            ext = file_path.suffix.lower()
-            if ext in _BINARY_EXTENSIONS:
-                continue
             try:
-                with file_path.open(errors="replace") as source:
+                resolved_file = file_path.resolve()
+                resolved_file.relative_to(base)
+            except (ValueError, OSError, RuntimeError):
+                continue
+            if resolved_file in seen_targets or resolved_file.suffix.lower() in _BINARY_EXTENSIONS:
+                continue
+            if not resolved_file.is_file():
+                continue
+            seen_targets.add(resolved_file)
+            try:
+                with resolved_file.open(encoding="utf-8", errors="replace") as source:
                     lines = chain.from_iterable(map(str.splitlines, source))
                     for i, line in enumerate(lines, 1):
                         if compiled.search(line):
                             results.append({
-                                "file": str(file_path.relative_to(base)),
+                                "file": resolved_file.relative_to(base).as_posix(),
                                 "line_number": i,
                                 "line": line.strip(),
                             })
@@ -169,6 +178,10 @@ def make_helpers(
         Returns:
             Dict with 'matches' (grouped by file) and 'files' (full contents).
         """
+        if max_files < 0:
+            raise ValueError("max_files must be non-negative")
+        if context_lines < 0:
+            raise ValueError("context_lines must be non-negative")
         results = grep(pattern, path, max_matches=max_matches)
         if not results:
             return {"matches": {}, "files": {}, "summary": "No matches found."}
@@ -212,21 +225,28 @@ def make_helpers(
         }
 
     def glob_files(pattern: str) -> list[str]:
-        matches = list(base.glob(pattern))
-        safe_matches: list[str] = []
+        if pathlib.Path(pattern).is_absolute():
+            raise PermissionError(f"Access denied: absolute pattern '{pattern}' is not allowed")
+        try:
+            matches = list(base.glob(pattern))
+        except NotImplementedError as exc:
+            raise PermissionError(f"Access denied: invalid glob pattern '{pattern}'") from exc
+        safe_matches: set[str] = set()
         for match in matches:
-            if not match.is_file():
-                continue
-            parts = match.relative_to(base).parts
-            if any(part in _SKIP_DIRS or part.startswith(".") for part in parts[:-1]):
-                continue
             try:
-                safe_matches.append(str(match.resolve().relative_to(base)))
-            except ValueError:
+                if not match.is_file():
+                    continue
+                parts = match.relative_to(base).parts
+                if any(part in _SKIP_DIRS or part.startswith(".") for part in parts[:-1]):
+                    continue
+                safe_matches.add(str(match.resolve().relative_to(base)))
+            except (ValueError, OSError, RuntimeError):
                 continue
-        return safe_matches
+        return sorted(safe_matches)
 
     def tree(path: str = ".", max_depth: int = 3) -> str:
+        if max_depth < 0:
+            raise ValueError("max_depth must be non-negative")
         target = _resolve_safe(path)
         lines = []
 
@@ -235,7 +255,7 @@ def make_helpers(
                 return
             try:
                 entries = sorted(dir_path.iterdir(), key=lambda e: (not e.is_dir(), e.name))
-            except PermissionError:
+            except OSError:
                 return
             visible = [
                 e for e in entries

@@ -250,3 +250,27 @@ def test_long_context_spec_uses_target_path_placeholder():
     spec = json.loads(Path("evals/specs/rlm_long_context.json").read_text())
     assert len(spec["evals"]) >= 3
     assert all("{target_path}" in item["prompt"] for item in spec["evals"])
+
+
+@pytest.mark.parametrize(("score", "count"), [(1.5, 1), (True, 1), (1.0, None), (1.0, "1")])
+def test_invalid_grade_is_unscorable(tmp_path, score, count):
+    run = tmp_path / "arm" / "case" / "run_001"
+    run.mkdir(parents=True)
+    (run / "grading.json").write_text(json.dumps({"score": score, "total": count}))
+    config, = aggregate_runs(tmp_path)["configs"]
+    assert config["scored_runs"] == 0
+    assert config["pass_rate"] is None
+
+
+@pytest.mark.parametrize("contents", ["null", "[]", "{"])
+def test_unreadable_artifact_does_not_abort_other_trials(tmp_path, contents):
+    for arm, grade in (("first", contents), ("second", '{"score": 1.0}')):
+        run = tmp_path / arm / "case" / "run_001"
+        run.mkdir(parents=True)
+        (run / "grading.json").write_text(grade)
+        (run / "timing.json").write_text(contents)
+        (run / "output.json").write_text(contents)
+    first, second = aggregate_runs(tmp_path)["configs"]
+    assert first["pass_rate"] is None
+    assert second["pass_rate"] == 1.0
+    assert second["mean_tokens"] is None

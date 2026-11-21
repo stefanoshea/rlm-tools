@@ -20,6 +20,14 @@ def _stddev(values: list[float]) -> float:
     return math.sqrt(variance)
 
 
+def _read_artifact(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def aggregate_runs(
     sample_runs_dir: str | Path,
     *,
@@ -42,15 +50,22 @@ def aggregate_runs(
         durations = []
         for path in sorted(set(config_files)):
             trial = path.relative_to(root).parts[1:3]
-            grading = json.loads(path.read_text())
+            grading = _read_artifact(path)
             timing_path = path.with_name("timing.json")
-            timing = json.loads(timing_path.read_text()) if timing_path.is_file() else {}
+            timing = _read_artifact(timing_path)
             prompt = grading.get("prompt")
-            if not isinstance(prompt, str) and (output_path := path.with_name("output.json")).is_file():
-                prompt = json.loads(output_path.read_text()).get("prompt")
+            if not isinstance(prompt, str):
+                prompt = _read_artifact(path.with_name("output.json")).get("prompt")
             if isinstance(prompt, str):
                 prompts_by_trial[trial].add(prompt)
-            score = grading["score"] if grading.get("total", 1) > 0 else None
+            raw_score = grading.get("score")
+            assertion_count = grading.get("total", 1)
+            score = (
+                raw_score
+                if type(assertion_count) is int and assertion_count > 0
+                and type(raw_score) in (int, float) and 0 <= raw_score <= 1
+                else None
+            )
             total = timing.get("total_tokens")
             tokens = total if type(total) is int and total >= 0 else None
             trials[trial] = score, tokens

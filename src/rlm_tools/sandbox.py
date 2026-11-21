@@ -204,12 +204,17 @@ class Sandbox:
         return self._helper_memory_bytes_used + self._worker_memory_bytes_used
 
     def _track_memory(self, value: int, from_bytes: bool = False) -> None:
-        size = value if from_bytes else value
-        if self.memory_bytes_used + size > self._max_memory_bytes:
+        if value > 0 and self.memory_bytes_used + value > self._max_memory_bytes:
             raise MemoryError(
-                f"Session memory limit exceeded: {self.memory_bytes_used + size} > {self._max_memory_bytes}"
+                f"Session memory limit exceeded: {self.memory_bytes_used + value} > {self._max_memory_bytes}"
             )
-        self._helper_memory_bytes_used += size
+        self._helper_memory_bytes_used = max(0, self._helper_memory_bytes_used + value)
+
+    def __enter__(self) -> "Sandbox":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
 
     def close(self) -> None:
         if not getattr(self, "_process", None):

@@ -2,13 +2,40 @@ import os
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from anthropic import Anthropic
+from anthropic import APIStatusError, Anthropic
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_MAX_RETRIES = 3
+
+
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, (ValueError, TypeError)):
+        return False
+    if isinstance(exc, APIStatusError):
+        return exc.status_code >= 500 or exc.status_code in {408, 409, 429}
+    return True
+
+
+def _extract_text(content) -> str:
+    if not content:
+        return ""
+    text_parts = [
+        block.text
+        for block in content
+        if getattr(block, "type", None) == "text"
+        and isinstance(getattr(block, "text", None), str)
+    ]
+    if text_parts:
+        return "".join(text_parts)
+    # Lightweight clients may return text blocks without a typed discriminator.
+    return "".join(
+        block.text for block in content
+        if not isinstance(getattr(block, "type", None), str)
+        and isinstance(getattr(block, "text", None), str)
+    )
 
 
 def get_client() -> Anthropic:
@@ -29,7 +56,7 @@ def make_llm_query(
     on_retry=None,
 ):
     _client = client or get_client()
-    _model = model or os.environ.get("RLM_SUB_MODEL", DEFAULT_MODEL)
+    _model = model or os.environ.get("RLM_SUB_MODEL") or DEFAULT_MODEL
     _timeout = (
         timeout_seconds
         if timeout_seconds is not None
@@ -63,11 +90,10 @@ def make_llm_query(
                     messages=messages,
                     timeout=_timeout,
                 )
-                if not response.content:
-                    return ""
-                first = response.content[0]
-                return getattr(first, "text", str(first))
+                return _extract_text(response.content)
             except Exception as e:  # noqa: BLE001 - retried then re-raised below
+                if not _is_retryable(e):
+                    raise
                 last_error = e
                 if attempt < attempts - 1:
                     logger.warning(
@@ -165,7 +191,7 @@ def make_recursive_query(
     """
     _client = client or get_client()
     _helpers = helpers or {}
-    _model = model or os.environ.get("RLM_SUB_MODEL", DEFAULT_MODEL)
+    _model = model or os.environ.get("RLM_SUB_MODEL") or DEFAULT_MODEL
     _timeout = (
         timeout_seconds
         if timeout_seconds is not None
@@ -192,6 +218,8 @@ def make_recursive_query(
                     timeout=_timeout,
                 )
             except Exception as e:  # noqa: BLE001 - retried then re-raised
+                if not _is_retryable(e):
+                    raise
                 last_error = e
                 if attempt < attempts - 1:
                     time.sleep(min(2 ** attempt * 0.5, 4.0))
@@ -199,7 +227,9 @@ def make_recursive_query(
 
     def _run_tool(name: str, args: dict, depth: int) -> str:
         if name == "recurse":
-            child_prompt = args.get("prompt", "")
+            child_prompt = args.get("prompt")
+            if not isinstance(child_prompt, str) or not child_prompt.strip():
+                return "[error: recurse requires a non-empty string 'prompt']"
             return _run(child_prompt, context="", depth=depth - 1)
         helper = _helpers.get(name)
         if helper is None:
@@ -220,7 +250,7 @@ def make_recursive_query(
         messages = [{"role": "user", "content": content}]
 
         last_text = ""
-        for _ in range(max_iterations):
+        for iteration in range(max_iterations):
             response = _create(messages, tools)
             text_parts = [
                 getattr(b, "text", "") for b in response.content
@@ -232,6 +262,8 @@ def make_recursive_query(
             tool_uses = [b for b in response.content if getattr(b, "type", None) == "tool_use"]
             if getattr(response, "stop_reason", None) != "tool_use" or not tool_uses:
                 return last_text
+            if iteration == max_iterations - 1:
+                return last_text
 
             messages.append({"role": "assistant", "content": response.content})
             tool_results = []
@@ -239,7 +271,8 @@ def make_recursive_query(
                 if block.name not in allowed_tools:
                     result = f"[error: unknown tool '{block.name}']"
                 else:
-                    result = _run_tool(block.name, dict(block.input), depth)
+                    tool_args = dict(block.input) if isinstance(block.input, dict) else {}
+                    result = _run_tool(block.name, tool_args, depth)
                     if gate is not None and block.name != "recurse":
                         result = gate(prompt, result)
                 tool_results.append({
@@ -259,6 +292,8 @@ def make_recursive_query(
 
 def make_llm_query_batched(llm_query_fn, max_workers: int = 8):
     def llm_query_batched(prompts: list[str], context: str = "") -> list[str]:
+        if isinstance(prompts, (str, bytes)):
+            raise TypeError("prompts must be a sequence of strings, not a single string")
         if not prompts:
             return []
 

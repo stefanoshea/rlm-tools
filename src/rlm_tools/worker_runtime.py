@@ -1,13 +1,22 @@
 import ast
 import builtins
+import collections
 import contextlib
+import functools
 import io
 import signal
 import sys
 import threading
 from contextlib import contextmanager
 from multiprocessing.connection import Connection
-from types import ModuleType
+from types import (
+    FunctionType,
+    GetSetDescriptorType,
+    MemberDescriptorType,
+    MethodDescriptorType,
+    ModuleType,
+    WrapperDescriptorType,
+)
 
 try:
     import resource
@@ -26,21 +35,51 @@ ALLOWED_MODULES = frozenset({
 BLOCKED_BUILTINS = frozenset({
     "compile", "eval", "exec", "__import__", "breakpoint",
     "delattr", "dir", "exit", "getattr", "globals",
+    "help", "license", "credits", "copyright",
     "input", "locals", "open", "quit", "setattr",
     "object", "type", "vars",
 })
+
+_ALLOWED_DUNDER_BUILTINS = frozenset({"__build_class__", "__debug__", "__name__"})
 
 # Method names that reach arbitrary attributes by string at runtime, bypassing
 # the AST dot-attribute guard (e.g. "{0.__class__}".format(obj)).
 BLOCKED_METHODS = frozenset({"format", "format_map"})
 
 # Members of otherwise-safe stdlib modules that defeat the AST guard by resolving
-# attributes from a string name. attrgetter/methodcaller can be aliased, so a
-# name-based AST check cannot catch them — the primitive must not exist.
+# attributes from a string name or wrapping functions to expose __wrapped__.
 SANITIZED_MODULE_ATTRS: dict[str, tuple[str, ...]] = {
+    "functools": ("update_wrapper", "wraps"),
     "operator": ("attrgetter", "methodcaller"),
     "string": ("Formatter",),
 }
+
+
+def _type_namespaces(cls):
+    # Read class metadata through the built-in descriptors.
+    mro = type.__dict__["__mro__"].__get__(cls)
+    for base in mro:
+        yield type.__dict__["__dict__"].__get__(base)
+
+
+def _shallow_size(value) -> int:
+    native_lookup = True
+    value_type = type(value)
+    for namespace in _type_namespaces(value_type):
+        if "__sizeof__" not in namespace:
+            continue
+        descriptor = namespace["__sizeof__"]
+        descriptor_type = type(descriptor)
+        if (
+            (descriptor_type is MethodDescriptorType or descriptor_type is WrapperDescriptorType)
+            and issubclass(value_type, descriptor.__objclass__)
+        ):
+            if native_lookup:
+                return sys.getsizeof(value)
+            # Preserve the base storage estimate without running a Python override.
+            return descriptor(value)
+        native_lookup = False
+    return object.__sizeof__(value)
 
 
 class _OutputCapture(io.StringIO):
@@ -103,17 +142,35 @@ def apply_resource_limits(
 
 def _make_restricted_import(allowed: frozenset[str]):
     original_import = builtins.__import__
+    sanitized_cache: dict[str, ModuleType] = {}
 
-    def restricted_import(name, *args, **kwargs):
-        if name not in allowed and name.split(".")[0] not in allowed:
+    def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if level != 0:
+            raise ImportError("Relative imports are not allowed in the sandbox")
+        if name not in allowed:
             raise ImportError(f"Import of '{name}' is not allowed in the sandbox")
-        module = original_import(name, *args, **kwargs)
-        forbidden = SANITIZED_MODULE_ATTRS.get(name.split(".")[0])
-        if forbidden:
-            target = sys.modules.get(name.split(".")[0], module)
-            for attr in forbidden:
-                target.__dict__.pop(attr, None)
-        return module
+        proxy = sanitized_cache.get(name)
+        if proxy is None:
+            module = original_import(name)
+            candidates = (
+                list(module.__all__)
+                if hasattr(module, "__all__")
+                else [k for k in vars(module) if not k.startswith("_")]
+            )
+            forbidden = set(SANITIZED_MODULE_ATTRS.get(name, ()))
+            proxy = ModuleType(name)
+            exported: list[str] = []
+            for attr in candidates:
+                if attr.startswith("_") or attr in forbidden or not hasattr(module, attr):
+                    continue
+                value = getattr(module, attr)
+                if isinstance(value, ModuleType):
+                    continue
+                setattr(proxy, attr, value)
+                exported.append(attr)
+            proxy.__all__ = exported
+            sanitized_cache[name] = proxy
+        return proxy
 
     return restricted_import
 
@@ -126,10 +183,6 @@ class HelperProxy:
         object.__setattr__(self, "_name", name)
 
     def __getattribute__(self, name: str):
-        if name in {"_conn", "_name"}:
-            return object.__getattribute__(self, name)
-        if name.startswith("_") or name.startswith("__"):
-            raise AttributeError(name)
         raise AttributeError(name)
 
     def __call__(self, *args, **kwargs):
@@ -164,10 +217,6 @@ class LocalTool:
         object.__setattr__(self, "_callback", callback)
 
     def __getattribute__(self, name: str):
-        if name == "_callback":
-            return object.__getattribute__(self, name)
-        if name.startswith("_") or name.startswith("__"):
-            raise AttributeError(name)
         raise AttributeError(name)
 
     def __call__(self, *args, **kwargs):
@@ -196,6 +245,7 @@ class WorkerRuntime:
         safe_builtins = {
             k: v for k, v in builtins.__dict__.items()
             if k not in BLOCKED_BUILTINS
+            and (not k.startswith("_") or k in _ALLOWED_DUNDER_BUILTINS)
         }
         safe_builtins["__import__"] = _make_restricted_import(ALLOWED_MODULES)
         self._namespace["__builtins__"] = safe_builtins
@@ -223,6 +273,23 @@ class WorkerRuntime:
                         f"'{node.attr}' is not allowed in the sandbox "
                         "(it can resolve attributes by name); use an f-string instead"
                     )
+            elif isinstance(node, ast.MatchClass):
+                for attr in node.kwd_attrs:
+                    if attr.startswith("_"):
+                        raise PermissionError(
+                            f"Access to private attribute '{attr}' is not allowed in the sandbox"
+                        )
+                    if attr in BLOCKED_METHODS:
+                        raise PermissionError(
+                            f"'{attr}' is not allowed in the sandbox "
+                            "(it can resolve attributes by name); use an f-string instead"
+                        )
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name.startswith("_"):
+                        raise PermissionError(
+                            f"Import of private name '{alias.name}' is not allowed in the sandbox"
+                        )
 
     @contextmanager
     def _execution_timeout(self):
@@ -258,7 +325,7 @@ class WorkerRuntime:
                 with self._execution_timeout():
                     self._validate_code(code)
                     exec(code, self._namespace)
-        except (Exception, SystemExit, KeyboardInterrupt) as e:
+        except BaseException as e:
             error = f"{type(e).__name__}: {e}"
 
         stdout = stdout_capture.getvalue()
@@ -313,37 +380,62 @@ class WorkerRuntime:
                 stack.pop()
                 continue
             obj_id = id(item)
-            if obj_id in seen or isinstance(item, ModuleType):
+            if obj_id in seen or issubclass(type(item), ModuleType):
                 continue
             seen.add(obj_id)
-            size += sys.getsizeof(item)
+            size += _shallow_size(item)
             if limit is not None and size > limit:
                 break
             stack.append(iter(self._children(item)))
         return size
 
     def _children(self, value):
-        if isinstance(value, dict):
+        value_type = type(value)
+        if issubclass(value_type, dict):
             for key, item in dict.items(value):
                 yield key
                 yield item
-        elif isinstance(value, list):
+        elif issubclass(value_type, list):
             yield from list.__iter__(value)
-        elif isinstance(value, tuple):
+        elif issubclass(value_type, tuple):
             yield from tuple.__iter__(value)
-        elif isinstance(value, set):
+        elif issubclass(value_type, set):
             yield from set.__iter__(value)
-        elif isinstance(value, frozenset):
+        elif issubclass(value_type, frozenset):
             yield from frozenset.__iter__(value)
-        elif not isinstance(value, (str, bytes, bytearray)):
-            if hasattr(value, "__dict__"):
-                yield vars(value)
-            slots = getattr(type(value), "__slots__", ())
-            if isinstance(slots, str):
-                slots = (slots,)
-            for slot in slots:
-                if hasattr(value, slot):
-                    yield getattr(value, slot)
+        elif issubclass(value_type, collections.deque):
+            yield from collections.deque.__iter__(value)
+        elif issubclass(value_type, functools.partial):
+            for attr in ("func", "args", "keywords"):
+                yield functools.partial.__dict__[attr].__get__(value)
+        elif value_type is FunctionType:
+            yield value.__defaults__
+            yield value.__kwdefaults__
+            if value.__closure__:
+                for cell in value.__closure__:
+                    try:
+                        yield cell.cell_contents
+                    except ValueError:
+                        pass
+
+        if value_type is str or value_type is bytes or value_type is bytearray:
+            return
+        has_instance_dict = False
+        for namespace in _type_namespaces(value_type):
+            dict_descriptor = namespace.get("__dict__")
+            if not has_instance_dict and type(dict_descriptor) is GetSetDescriptorType:
+                try:
+                    yield dict_descriptor.__get__(value)
+                except AttributeError:
+                    pass
+                has_instance_dict = True
+            if "__slots__" in namespace:
+                for descriptor in namespace.values():
+                    if type(descriptor) is MemberDescriptorType:
+                        try:
+                            yield descriptor.__get__(value)
+                        except AttributeError:
+                            pass
 
 
 def worker_main(

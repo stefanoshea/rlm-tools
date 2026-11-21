@@ -16,7 +16,6 @@ automatically rather than waiting to be chosen.
 
 from __future__ import annotations
 
-import math
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -52,7 +51,7 @@ def get_client(api_key: str | None = None, model: str | None = None) -> SystemOn
         )
     return TypeSafeClient(
         api_key=key,
-        model=model or os.environ.get("TYPESAFE_DEFAULT_MODEL", DEFAULT_MODEL),
+        model=model or os.environ.get("TYPESAFE_DEFAULT_MODEL") or DEFAULT_MODEL,
     )
 
 
@@ -68,6 +67,14 @@ def _index_chunks(count: int, size: int) -> list[list[int]]:
     return [list(range(i, min(i + size, count))) for i in range(0, count, size)]
 
 
+def _is_probability(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and 0 <= value <= 1
+    )
+
+
 def make_scorer(
     client: SystemOneClient | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
@@ -80,6 +87,10 @@ def make_scorer(
     ``reserve`` is called with the number of API requests the scorer is about to
     make, so the session can charge them against a budget before they run.
     """
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be >= 1")
+    if max_workers < 1:
+        raise ValueError("max_workers must be >= 1")
     _client = client or get_client()
 
     def score_all(items: list[str], question: str) -> list[float]:
@@ -102,7 +113,10 @@ def make_scorer(
                     for i in indexes
                 },
             )
-            return {i: float(response.nouls[f"c{i}"].noul) for i in indexes}
+            probabilities = {i: response.nouls[f"c{i}"].noul for i in indexes}
+            if not all(map(_is_probability, probabilities.values())):
+                raise ValueError("Expected one probability per candidate")
+            return {i: float(probability) for i, probability in probabilities.items()}
 
         batches = _index_chunks(len(items), chunk_size)
         scores: dict[int, float] = {}
@@ -166,7 +180,7 @@ def make_evidence_gate(
         try:
             scores = score_all(chunks, f"this excerpt helps answer: {question}")
             if len(scores) != len(chunks) or not all(
-                math.isfinite(score) and 0 <= score <= 1 for score in scores
+                map(_is_probability, scores)
             ):
                 raise ValueError("Expected one probability per evidence chunk")
         except Exception as e:

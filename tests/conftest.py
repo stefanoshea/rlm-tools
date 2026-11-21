@@ -8,6 +8,7 @@ quietly spending tokens.
 
 import pytest
 
+import rlm_tools.llm_bridge as llm_bridge
 import rlm_tools.semantic as semantic
 
 
@@ -17,6 +18,7 @@ def no_live_model_calls(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
     def _blocked(*args, **kwargs):
-        raise RuntimeError("live TypeSafe calls are disabled in tests; inject a client")
+        raise RuntimeError("live model calls are disabled in tests; inject a client")
 
     monkeypatch.setattr(semantic, "get_client", _blocked)
+    monkeypatch.setattr(llm_bridge, "get_client", _blocked)

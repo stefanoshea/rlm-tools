@@ -39,7 +39,7 @@ def _same_json(actual: Any, expected: Any) -> bool:
 
 
 def load_eval_specs(path: str | Path) -> list[EvalSpec]:
-    data = json.loads(Path(path).read_text())
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(data, dict):
         cases = data.get("evals", [])
     else:

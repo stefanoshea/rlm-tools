@@ -35,7 +35,7 @@ _mcp_session_locks: WeakValueDictionary[str, Lock] = WeakValueDictionary()
 
 
 def _scan_metadata(path: str) -> dict:
-    root = pathlib.Path(path)
+    root = pathlib.Path(path).resolve()
     extensions: dict[str, int] = {}
     total_files = 0
     total_lines = 0
@@ -57,7 +57,7 @@ def _scan_metadata(path: str) -> dict:
 
         if ext.lower() not in _BINARY_EXTENSIONS:
             try:
-                with target.open(errors="replace") as f:
+                with target.open(encoding="utf-8", errors="replace") as f:
                     file_line_count = sum(1 for _ in f)
                 total_lines += file_line_count
 
@@ -134,6 +134,8 @@ def _install_session_llm_tools(session, sandbox: Sandbox, reserve=None, gate=Non
             return base_llm_query(prompt, context)
 
         def llm_query_batched(prompts: list[str], context: str = "") -> list[str]:
+            if isinstance(prompts, (str, bytes)):
+                raise TypeError("prompts must be a sequence of strings, not a single string")
             if not prompts:
                 return []
             _reserve_llm_calls(len(prompts))
@@ -271,19 +273,24 @@ def _initialize_session(
         response["strategy"] = (
             "You are exploring a codebase through code. "
             "Each rlm_execute call should batch 3-5+ operations into a single Python script. "
-            "Pattern: tree/grep to find targets -> read only the files that survive -> print a summary. "
+            "Pattern: tree/grep to find targets -> read only the files that survive -> print a summary "
+            "or call rlm_finalize(value) to return structured data. "
             "Aim for ~5-15 rlm_execute calls total, not 50+. "
             "A wide case-insensitive grep_summary beats several narrow greps: it costs one call and "
             "shows you which files matter before you read any of them. "
-            "Use llm_query() for semantic analysis on extracted snippets. "
-            "Use llm_query_batched() when analyzing multiple snippets concurrently. "
             "Variables persist between calls — build on previous results."
         )
+        if has_llm_tools:
+            response["strategy"] += (
+                " Use rlm_recurse() to delegate focused sub-questions to a recursive sub-agent, "
+                "llm_query() for flat semantic analysis on extracted snippets, "
+                "and *_batched() when analyzing multiple snippets concurrently."
+            )
         response["example"] = (
             "# Good: orient, cast a wide net, then read only the survivors\n"
             "print(tree('.', max_depth=3))\n"
-            "print(grep_summary(r'(?i)flag|feature_', '.'))\n"
-            "for path in ['app/export/pipeline.py', 'app/feature_flags.py']:\n"
+            "matches = grep(r'(?i)flag|feature_', '.')\n"
+            "for path in sorted({m['file'] for m in matches})[:3]:\n"
             "    print('=' * 20, path)\n"
             "    print(read_file(path)[:2000])\n"
         )
@@ -397,11 +404,11 @@ async def rlm_start(
     path: Annotated[str, Field(description="Absolute path to the directory to explore")],
     query: Annotated[str, Field(description="What you want to find or analyze")],
     max_output_chars: Annotated[int, Field(description="Max characters per execute output", ge=100, le=100_000)] = 15_000,
-    max_llm_calls: Annotated[int, Field(description="Maximum llm_query/llm_query_batched calls for this session", ge=1, le=10_000)] = 50,
+    max_llm_calls: Annotated[int, Field(description="Maximum model calls (llm_query, rlm_recurse, and evidence gate) for this session", ge=1, le=10_000)] = 50,
     max_execute_calls: Annotated[int, Field(description="Maximum rlm_execute calls for this session", ge=1, le=10_000)] = 50,
     execution_timeout_seconds: Annotated[int, Field(description="Per-rlm_execute timeout in seconds", ge=1, le=300)] = 30,
     include_guidance: Annotated[bool, Field(description="Include strategy/example guidance text in the response (larger payload)")] = False,
-    include_metadata: Annotated[bool, Field(description="Scan directory and include file counts/types in response (set false for faster startup)")] = False,
+    include_metadata: Annotated[bool, Field(description="Scan directory and include file counts/types in response (default false for faster startup)")] = False,
     max_memory_bytes: Annotated[int, Field(description="Maximum in-memory bytes retained for this session", ge=1024, le=100_000_000)] = 10_000_000,
 ) -> str:
     """Start an RLM exploration session. Returns session_id, metadata, limits, and available functions. Set include_guidance=true to include strategy/example coaching text."""

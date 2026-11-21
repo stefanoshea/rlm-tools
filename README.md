@@ -94,8 +94,9 @@ The sandbox provides built-in helpers:
 - `grep(pattern)` / `grep_summary(pattern)` / `grep_read(pattern)` — Search
 - `glob_files(pattern)` — Find files by pattern
 - `tree(path, max_depth)` — Directory structure
-- `llm_query(prompt, context)` — Sub-LLM analysis (optional, requires API key)
-- `rlm_recurse(prompt, context)` — Ask a sub-agent to explore the session directory (optional, requires API key)
+- `llm_query(prompt, context)` / `llm_query_batched(prompts, context)` — Sub-LLM analysis (optional, requires API key)
+- `rlm_recurse(prompt, context)` / `rlm_recurse_batched(prompts, context)` — Ask a sub-agent to explore the session directory (optional, requires API key)
+- `rlm_finalize(value)` — Return structured final output in `rlm_execute` responses
 
 Variables persist across `rlm_execute` calls within a session. The agent can build up understanding incrementally — search, filter, read, analyze — without any intermediate data touching the context window.
 
@@ -206,9 +207,9 @@ The core exploration features (read, grep, glob, tree) require no API key. `llm_
 
 The sandbox is read-only and restricted:
 
-- **Imports**: Safe stdlib only (re, json, collections, math, etc.)
-- **Builtins**: Blocks exec, eval, compile, `__import__`, getattr/setattr, breakpoint
-- **Attribute access**: AST guard blocks dunder access (`x.__class__`); runtime string-to-attribute resolvers are closed off too — `str.format`/`format_map` are blocked (use f-strings) and `operator.attrgetter`/`methodcaller` and `string.Formatter` are stripped on import, since those bypass the AST guard and can be aliased
+- **Imports**: Sanitized proxies over safe stdlib modules only (`re`, `json`, `collections`, `math`, `fnmatch`, `itertools`, `functools`, `operator`, `string`, `textwrap`, `difflib`, `statistics`); relative imports, private `from ... import _name` imports, and leaked submodule attributes (such as `fnmatch.os` or `statistics.sys`) are blocked
+- **Builtins**: Provides a restricted `__import__` and blocks `exec`, `eval`, `compile`, `getattr`/`setattr`/`delattr`, `globals`/`locals`/`vars`, `dir`, `object`, `type`, `open`, `breakpoint`, interactive/help builtins (`help`, `license`, `credits`, `copyright`, `input`, `exit`, `quit`), and unallowlisted dunder builtins (such as `__loader__`, `__spec__`)
+- **Attribute access**: AST guard blocks private/dunder attribute access (`x.__class__`) and `match` class-pattern dunder access; runtime string-to-attribute resolvers are closed off too — `str.format`/`format_map` are blocked (use f-strings), and `operator.attrgetter`/`methodcaller`, `string.Formatter`, and `functools.update_wrapper`/`wraps` are stripped from the exposed module proxies since they bypass or sidestep the AST guard
 - **File access**: Read-only, scoped to session directory, path traversal blocked, and symlinks resolving outside the root are skipped by both `read_file` and `grep`
 - **File freshness**: Cached reads are keyed by mtime, so an edited file is re-read rather than served stale
 - **Execution**: On POSIX the worker has a configurable execution timeout (default 30s). A helper already running in the parent finishes before the timeout is reported. Model requests have their own timeout and retry settings. CPU and address-space limits depend on OS support.
@@ -232,13 +233,13 @@ uv run --no-sync python -m pytest
 Run fixture-backed evals:
 
 ```bash
-uv run python -m pytest evals -q
+uv run --extra dev python -m pytest evals -q
 ```
 
 Run comparative benchmarks:
 
 ```bash
-uv run python -m pytest evals/test_comparative.py -q -s
+uv run --extra dev python -m pytest evals/test_comparative.py -q -s
 ```
 
 Run scored prompt benchmarks:

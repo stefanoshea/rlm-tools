@@ -234,3 +234,12 @@ def test_low_separation_is_recorded():
 
     assert records[0]["outcome"] == "passed_through_low_separation"
     assert records[0]["separation"] == pytest.approx(0.08)
+
+
+def test_boolean_scores_fail_open_and_return_original_text():
+    records: list[dict] = []
+    gate = make_evidence_gate(lambda items, question: [True, False], min_chars=10, on_gate=records.append)
+    text = _text(["alpha", "beta"])
+
+    assert gate("what does this do?", text) is text
+    assert records[0]["outcome"] == "failed_open"

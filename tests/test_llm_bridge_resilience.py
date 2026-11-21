@@ -1,6 +1,10 @@
 """Timeout, retry, and error-surfacing behavior for the sub-LLM bridge."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import httpx
+import pytest
+from anthropic import APIStatusError
 
 from rlm_tools.llm_bridge import make_llm_query, make_llm_query_batched
 
@@ -65,3 +69,35 @@ def test_batched_marks_failed_prompts_distinctly():
     assert results[2] == "fine"
     assert results[1].startswith("[ERROR]")
     assert "kaboom" in results[1]
+
+
+@pytest.mark.parametrize("status_code", [400, 401])
+def test_non_retryable_status_error_fails_immediately(status_code):
+    mock_client = MagicMock()
+    response = httpx.Response(
+        status_code,
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+    )
+    mock_client.messages.create.side_effect = APIStatusError(
+        "client error", response=response, body=None
+    )
+
+    query_fn = make_llm_query(client=mock_client, model="m", max_retries=3)
+    with patch("rlm_tools.llm_bridge.time.sleep") as mock_sleep:
+        with pytest.raises(APIStatusError):
+            query_fn("hi")
+
+    assert mock_client.messages.create.call_count == 1
+    mock_sleep.assert_not_called()
+
+
+def test_batched_rejects_single_string_prompts():
+    batch_fn = make_llm_query_batched(lambda p, c="": p)
+    with pytest.raises(TypeError, match="sequence of strings"):
+        batch_fn("not a list")
+
+
+def test_flat_query_returns_empty_text_for_only_non_text_blocks():
+    client = MagicMock()
+    client.messages.create.return_value.content = [MagicMock(type="tool_use")]
+    assert make_llm_query(client=client)("hello") == ""

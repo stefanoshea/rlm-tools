@@ -19,16 +19,16 @@ class TestRobustness:
         assert "PermissionError" in result["error"]
 
     def test_large_output_truncates(self):
-        sandbox = Sandbox(base_path="tests/fixtures/rlm_corpus_py", max_output_chars=40)
-        result = sandbox.execute("print('x' * 200)")
-        assert "... [output truncated]" in result.stdout
+        with Sandbox(base_path="tests/fixtures/rlm_corpus_py", max_output_chars=40) as sandbox:
+            result = sandbox.execute("print('x' * 200)")
+            assert "... [output truncated]" in result.stdout
 
     def test_execution_timeout_surfaces_as_error(self):
-        sandbox = Sandbox(
+        with Sandbox(
             base_path="tests/fixtures/rlm_corpus_py",
             max_output_chars=10_000,
             execution_timeout_seconds=1,
-        )
-        result = sandbox.execute("while True:\n    pass")
-        assert result.error is not None
-        assert "timed out" in result.error
+        ) as sandbox:
+            result = sandbox.execute("while True:\n    pass")
+            assert result.error is not None
+            assert "timed out" in result.error

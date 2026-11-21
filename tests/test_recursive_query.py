@@ -138,3 +138,48 @@ def test_recurse_counts_each_model_call():
     )
     recurse("q")
     assert sum(calls) == 2
+
+
+def test_recurse_skips_final_iteration_tools_and_gate():
+    tool_calls = {}
+    helpers = _helpers(tool_calls)
+    gate_calls = []
+    client = MagicMock()
+    client.messages.create.side_effect = [
+        _Resp(
+            [_Block("text", text="partial"), _Block("tool_use", name="grep_summary", input={"pattern": "a"})],
+            stop_reason="tool_use",
+        ),
+        _Resp(
+            [_Block("text", text="best answer"), _Block("tool_use", name="read_file", input={"path": "a.py"})],
+            stop_reason="tool_use",
+        ),
+    ]
+
+    recurse = make_recursive_query(
+        client=client,
+        helpers=helpers,
+        model="m",
+        max_depth=1,
+        max_iterations=2,
+        gate=lambda q, text: gate_calls.append(text) or text,
+    )
+    answer = recurse("q")
+
+    assert answer == "best answer"
+    assert tool_calls["grep_summary"].call_count == 1
+    assert tool_calls["read_file"].call_count == 0
+    assert len(gate_calls) == 1
+
+
+def test_recurse_empty_child_prompt_returns_tool_error():
+    client = MagicMock()
+    client.messages.create.side_effect = [
+        _Resp([_Block("tool_use", name="recurse", input={"prompt": "   "})], stop_reason="tool_use"),
+        _Resp([_Block("text", text="recovered")], stop_reason="end_turn"),
+    ]
+
+    recurse = make_recursive_query(client=client, helpers=_helpers({}), model="m", max_depth=1)
+    assert recurse("parent") == "recovered"
+    messages = client.messages.create.call_args.kwargs["messages"]
+    assert "non-empty string" in messages[-1]["content"][0]["content"]

@@ -93,9 +93,10 @@ def upsert_policy_block(existing_text: str) -> str:
 
 
 def write_policy(path: Path) -> None:
-    existing_text = path.read_text() if path.exists() else ""
+    existing_text = path.read_text(encoding="utf-8") if path.exists() else ""
     updated_text = upsert_policy_block(existing_text)
-    path.write_text(updated_text)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(updated_text, encoding="utf-8")
 
 
 def main() -> None:

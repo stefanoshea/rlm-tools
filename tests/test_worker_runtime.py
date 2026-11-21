@@ -156,3 +156,78 @@ def test_helper_timeout_keeps_worker_protocol_in_sync(tmp_path):
         assert sandbox.execute("print('next request')").stdout == "next request\n"
     finally:
         sandbox.close()
+
+
+def test_deque_and_partial_memory_counted_against_limit(tmp_path):
+    with Sandbox(base_path=str(tmp_path), max_memory_bytes=2_000) as sandbox:
+        deque_result = sandbox.execute("import collections\nd = collections.deque(['a' * 3000])")
+        assert deque_result.error is not None
+        assert "MemoryError:" in deque_result.error
+
+    with Sandbox(base_path=str(tmp_path), max_memory_bytes=2_000) as sandbox:
+        partial_result = sandbox.execute(
+            "import functools\np = functools.partial(len, 'a' * 3000)"
+        )
+        assert partial_result.error is not None
+        assert "MemoryError:" in partial_result.error
+
+
+def test_accounting_does_not_invoke_list_subclass_memory_hooks(tmp_path):
+    with Sandbox(base_path=str(tmp_path), max_memory_bytes=50_000) as sandbox:
+        code = (
+            "memory_hooks = []\n"
+            "class CustomList(list):\n"
+            "    def __getattribute__(self, name):\n"
+            "        memory_hooks.append(name)\n"
+            "        raise AttributeError(name)\n"
+            "    @property\n"
+            "    def __dict__(self):\n"
+            "        memory_hooks.append('dict')\n"
+            "        return {}\n"
+            "    def __getattr__(self, name):\n"
+            "        memory_hooks.append('getattr')\n"
+            "        raise AttributeError(name)\n"
+            "    def __sizeof__(self):\n"
+            "        memory_hooks.append('sizeof')\n"
+            "        return 0\n"
+            "values = CustomList(['first', 'second'])\n"
+            "print('created')\n"
+        )
+        first = sandbox.execute(code)
+        assert first.error is None
+        assert first.stdout.strip() == "created"
+        second = sandbox.execute("print(memory_hooks)")
+        assert second.error is None
+        assert second.stdout.strip() == "[]"
+
+
+def test_accounting_uses_partial_storage_and_inherited_slots():
+    runtime = _runtime()
+    result = runtime.execute(
+        "import functools\n"
+        "memory_hooks = []\n"
+        "class CustomPartial(functools.partial):\n"
+        "    @property\n"
+        "    def args(self):\n"
+        "        memory_hooks.append('args')\n"
+        "        return ()\n"
+        "class Base:\n"
+        "    __slots__ = ('contents',)\n"
+        "    def __init__(self, value):\n"
+        "        self.contents = value\n"
+        "class Child(Base):\n"
+        "    __slots__ = ()\n"
+        "partial_value = CustomPartial(len, 'x' * 3000)\n"
+        "slotted_value = Child('y' * 3000)\n"
+    )
+
+    assert result.error is None
+    assert result.memory_bytes_used >= 6000
+    assert runtime.execute("print(memory_hooks)").stdout.strip() == "[]"
+
+
+def test_sandbox_context_manager_closes_worker(tmp_path):
+    with Sandbox(base_path=str(tmp_path)) as sandbox:
+        process = sandbox._process
+        assert process.is_alive()
+    assert not process.is_alive()

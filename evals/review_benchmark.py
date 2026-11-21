@@ -41,7 +41,7 @@ def main() -> None:
     parser.add_argument("benchmark_json", help="Path to benchmark.json")
     args = parser.parse_args()
 
-    summary = json.loads(Path(args.benchmark_json).read_text())
+    summary = json.loads(Path(args.benchmark_json).read_text(encoding="utf-8"))
     for note in review_benchmark(summary):
         print(note)
 

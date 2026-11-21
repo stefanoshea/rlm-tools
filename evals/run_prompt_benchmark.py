@@ -73,14 +73,14 @@ def run_benchmark(
                     "eval_id": spec.eval_id,
                     "prompt": spec.prompt,
                     "output": output_text,
-                }, indent=2))
-                (run_root / "timing.json").write_text(json.dumps(timing, indent=2))
+                }, indent=2), encoding="utf-8")
+                (run_root / "timing.json").write_text(json.dumps(timing, indent=2), encoding="utf-8")
                 grading_path = run_root / "grading.json"
-                grading_path.write_text(json.dumps(grading, indent=2))
+                grading_path.write_text(json.dumps(grading, indent=2), encoding="utf-8")
                 grading_files.append(grading_path)
 
     benchmark = aggregate_runs(root, grading_files=grading_files)
-    (root / "benchmark.json").write_text(json.dumps(benchmark, indent=2))
+    (root / "benchmark.json").write_text(json.dumps(benchmark, indent=2), encoding="utf-8")
     return benchmark
 
 
@@ -119,15 +119,15 @@ def run_benchmark_from_results(
                     "eval_id": eval_id,
                     "prompt": prompt,
                     "output": output_text,
-                }, indent=2))
-                (run_root / "timing.json").write_text(json.dumps(_timing(payload), indent=2))
+                }, indent=2), encoding="utf-8")
+                (run_root / "timing.json").write_text(json.dumps(_timing(payload), indent=2), encoding="utf-8")
                 grading["prompt"] = prompt
                 grading_path = run_root / "grading.json"
-                grading_path.write_text(json.dumps(grading, indent=2))
+                grading_path.write_text(json.dumps(grading, indent=2), encoding="utf-8")
                 grading_files.append(grading_path)
 
     benchmark = aggregate_runs(root, grading_files=grading_files, expected_cases=specs)
-    (root / "benchmark.json").write_text(json.dumps(benchmark, indent=2))
+    (root / "benchmark.json").write_text(json.dumps(benchmark, indent=2), encoding="utf-8")
     return benchmark
 
 
@@ -147,7 +147,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.raw_results:
-        raw_results = json.loads(Path(args.raw_results).read_text())
+        raw_results = json.loads(Path(args.raw_results).read_text(encoding="utf-8"))
         benchmark = run_benchmark_from_results(args.spec, args.output_dir, raw_results, judge=judge_from_env())
     else:
         raise SystemExit("--raw-results is required when using the CLI")

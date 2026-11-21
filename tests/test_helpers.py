@@ -279,3 +279,46 @@ def test_grep_read_max_files():
         result = helpers["grep_read"]("def", max_files=2)
         assert len(result["files"]) == 2
         assert "more" in result["summary"]
+
+
+def test_read_files_rejects_single_string(tmp_path):
+    (tmp_path / "a.txt").write_text("hello")
+    helpers, _ = make_helpers(str(tmp_path))
+    with pytest.raises(TypeError, match="list of file paths"):
+        helpers["read_files"]("a.txt")
+
+
+def test_grep_read_rejects_negative_limits(tmp_path):
+    helpers, _ = make_helpers(str(tmp_path))
+    with pytest.raises(ValueError, match="max_files"):
+        helpers["grep_read"]("x", max_files=-1)
+    with pytest.raises(ValueError, match="context_lines"):
+        helpers["grep_read"]("x", context_lines=-1)
+
+
+def test_glob_files_validation_determinism_and_symlink_safety(tmp_path):
+    (tmp_path / "b.py").write_text("b")
+    (tmp_path / "a.py").write_text("a")
+    os.symlink(tmp_path / "a.py", tmp_path / "a_alias.py")
+    os.symlink(tmp_path / "loop_b", tmp_path / "loop_a")
+    os.symlink(tmp_path / "loop_a", tmp_path / "loop_b")
+
+    helpers, _ = make_helpers(str(tmp_path))
+    with pytest.raises(PermissionError, match="absolute"):
+        helpers["glob_files"]("/etc/*")
+
+    results = helpers["glob_files"]("**/*.py")
+    assert results == ["a.py", "b.py"]
+
+
+def test_grep_deduplicates_internal_symlinks_and_is_sorted(tmp_path):
+    (tmp_path / "z.py").write_text("needle\n")
+    (tmp_path / "a.py").write_text("needle\n")
+    (tmp_path / "hidden.bin").write_text("needle\n")
+    os.symlink(tmp_path / "a.py", tmp_path / "0_alias.bin")
+    os.symlink(tmp_path / "a.py", tmp_path / "alias_to_a.py")
+    os.symlink(tmp_path / "hidden.bin", tmp_path / "alias_to_binary.py")
+
+    helpers, _ = make_helpers(str(tmp_path))
+    results = helpers["grep"]("needle")
+    assert [match["file"] for match in results] == ["a.py", "z.py"]
