@@ -2,31 +2,55 @@
 
 <!-- mcp-name: io.github.stefanoshea/rlm-tools -->
 
-Large grep results and file reads can fill an AI coding agent's context window before it has answered the question.
+RLM Tools gives coding agents a read-only Python sandbox for exploring a repository. An agent can search files, keep results in memory across calls, and return a count, a list of paths, or a short excerpt to the conversation. Local exploration needs no API key. Optional model helpers can send repository content to an external provider when you enable them for that workspace.
 
-RLM Tools gives your agent a persistent sandbox to explore code in. Local exploration keeps intermediate file reads and search results in the server process. The agent receives the output it asks for. Optional model helpers can send repository content to external providers.
+## Plugins & Extensions
 
-RLM Tools keeps raw context in tool-side memory and exposes a genuinely recursive explorer: `rlm_recurse` runs its own server-side tool-use loop (grep/read/glob/tree) and can spawn depth-limited child agents, so a sub-question is answered by exploring the corpus directly instead of dumping it into the root agent's context. Scored evals and prompt benchmarks measure answer quality alongside efficiency.
+The 0.1.3 plugins register the MCP server and install the `rlm-explore` skill for Codex CLI, Claude Code, and Gemini CLI. The server runs on macOS and Linux and requires `uvx` on the client's `PATH`. Run `uvx --version` in your terminal to check. Linux also requires `libseccomp.so.2`. [Release notes](https://github.com/stefanoshea/rlm-tools/releases/tag/v0.1.3) · [Install uv](https://docs.astral.sh/uv/getting-started/installation/)
 
-```bash
-# For Codex / generic MCP clients
-uvx --from rlm-tools rlm-tools-setup --write-policy AGENTS.md
+For Cursor, VS Code, Kiro, and standalone MCP setup, see [other clients and installation methods](#other-clients).
 
-# For Claude Code
-uvx --from rlm-tools rlm-tools-setup --write-policy CLAUDE.md
+### Codex CLI
+
+Install the plugin once from your terminal.
+
+```sh
+codex plugin marketplace add stefanoshea/rlm-tools
+codex plugin add rlm-tools@rlm-tools
 ```
 
-This auto-detects Claude/Codex on your PATH, registers the MCP server, and writes a policy block that nudges agents toward `rlm-tools` for repo exploration. Use `CLAUDE.md` for Claude Code (it reads this file automatically) or `AGENTS.md` for other clients.
+Each time you start Codex, run this from the repository you want to explore. Codex launches the server in the installed plugin directory, so the workspace grant tells it which checkout it can read.
 
-If you prefer manual setup:
-
-```bash
-# Claude Code
-claude mcp add rlm-tools -- uvx rlm-tools
-
-# Codex
-codex mcp add rlm-tools -- uvx rlm-tools
+```sh
+RLM_ALLOWED_ROOTS="$(pwd -P)" codex --no-daemon
 ```
+
+### Claude Code
+
+Open Claude Code in your repository and enter these commands at the Claude prompt.
+
+```text
+/plugin marketplace add stefanoshea/rlm-tools
+/plugin install rlm-tools@rlm-tools
+```
+
+### Gemini CLI
+
+Install the extension from your terminal.
+
+```sh
+gemini extensions install https://github.com/stefanoshea/rlm-tools
+```
+
+Restart Gemini in your repository and run `/skills list`. You should see `rlm-explore`, ready to load when an exploration task needs it.
+
+### Try it
+
+Try this prompt in the client you just configured.
+
+> Use RLM Tools to list the top-level directories in this repository, then close the session.
+
+The agent should call `rlm_start`, run `tree(max_depth=1)` through `rlm_execute`, and finish with `rlm_end`. If startup returns `Directory outside RLM_ALLOWED_ROOTS`, check that the MCP server received the absolute path to your checkout. [Workspace configuration](#configuration)
 
 ## What Changes
 
@@ -129,34 +153,10 @@ and pass both API keys, set `RLM_RECURSE_GATE=1`, and include the repository in 
 
 RLM Tools is a standard [MCP](https://modelcontextprotocol.io) server. It works with any MCP-compatible client: **Claude Code**, **Codex**, **Cursor**, and others.
 
-### Plugins & Extensions
+### Other clients
 
-Install `rlm-tools` with its bundled `rlm-explore` skill (`SKILL.md`) via your client's plugin or extension manager:
-
-- **Claude Code:**
-  ```bash
-  /plugin marketplace add stefanoshea/rlm-tools
-  /plugin install rlm-tools@rlm-tools
-  ```
-- **Codex CLI** (Agent Plugins 1.0):
-  ```bash
-  codex plugin marketplace add stefanoshea/rlm-tools
-  codex plugin add rlm-tools@rlm-tools
-  ```
-  Then run this from the repository you want to explore each time you start Codex:
-  ```bash
-  RLM_ALLOWED_ROOTS="$(pwd -P)" codex --no-daemon
-  ```
-  Codex starts the bundled server in the plugin's installation directory. The plugin forwards the workspace grant from this Codex process, so `rlm_start` can open the selected repository and its descendants.
-- **Cursor, VS Code / GitHub Copilot, Amazon Kiro:** Install from `plugins/rlm-tools` (uses the Agent Plugins 1.0 manifest with bundled `SKILL.md` and `mcp.json`).
-- **Gemini CLI:**
-  ```bash
-  gemini extensions install https://github.com/stefanoshea/rlm-tools
-  ```
-  Restart Gemini and run `/skills list` to see `rlm-explore`.
-- **Standalone skill (`agentskills.io`):** `plugins/rlm-tools/skills/rlm-explore/SKILL.md` works with Windsurf, OpenCode, Cline, Zed, and other Agent Skills clients alongside standard MCP registration (`uvx rlm-tools`).
-
-Exploration is read-only. On clients that launch the portable MCP server from the plugin directory, configure `RLM_ALLOWED_ROOTS` in the server environment for the project you want to explore. External model helpers require a separate opt-in.
+- **Cursor, VS Code / GitHub Copilot, and Amazon Kiro** can use the Agent Plugins 1.0 package in [plugins/rlm-tools](plugins/rlm-tools). If your client starts the server from the plugin directory, set `RLM_ALLOWED_ROOTS` to the absolute checkout path in the server environment.
+- **Agent Skills clients** such as Windsurf, OpenCode, Cline, and Zed can use the [standalone skill](plugins/rlm-tools/skills/rlm-explore/SKILL.md) alongside a standard MCP registration for `uvx rlm-tools`.
 
 ### Optional Strict Mode
 
@@ -179,6 +179,18 @@ If your MCP client supports tool permissions or hooks, disable/block default rea
 ```
 
 ### Setup helper command
+
+To configure a single client and write exploration guidance into the current repository, run the corresponding command from its root.
+
+```sh
+# Codex
+uvx --from rlm-tools rlm-tools-setup --client codex --write-policy AGENTS.md
+
+# Claude Code
+uvx --from rlm-tools rlm-tools-setup --client claude --write-policy CLAUDE.md
+```
+
+To register just the server manually, use `codex mcp add rlm-tools -- uvx rlm-tools` or `claude mcp add rlm-tools -- uvx rlm-tools`.
 
 ```bash
 # Auto-detect Claude/Codex CLIs and configure rlm-tools
