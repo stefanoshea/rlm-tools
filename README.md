@@ -295,6 +295,8 @@ Run scored prompt benchmarks:
 
 By default this now runs the checked-in long-context benchmark corpus at `tests/fixtures/rlm_corpus_longcontext`. Use `RLM_AB_SPEC_PATH` and `RLM_AB_TARGET_PATH` to switch back to lighter smoke-style cases or to point at a different corpus.
 
+[![Rlm Tools MCP server](https://mcprush.com/badge/rlm-tools-mcp/card.svg)](https://mcprush.com/to/rlm-tools-mcp?ref=badge)
+
 ## License
 
 MIT
