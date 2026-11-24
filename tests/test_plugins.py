@@ -185,3 +185,18 @@ def test_skill_frontmatter_and_no_symlinks():
         assert root_dir.is_dir() and not root_dir.is_symlink()
         for entry in root_dir.rglob("*"):
             assert not entry.is_symlink(), f"Unexpected symlink in plugin tree: {entry}"
+
+
+def test_claude_plugin_subagent_rlm_explorer():
+    agent_path = REPO_ROOT / "plugins" / "rlm-tools" / "agents" / "rlm-explorer.md"
+    assert agent_path.is_file() and not agent_path.is_symlink()
+    meta, body = _parse_frontmatter(agent_path.read_text(encoding="utf-8"))
+    assert meta.get("name") == "rlm-explorer"
+    assert meta.get("description")
+    assert meta.get("model") == "haiku"
+    assert "tools" not in meta
+    disallowed = {item.strip() for item in meta.get("disallowedTools", "").split(",") if item.strip()}
+    for tool_name in ("Bash", "Edit", "Write", "Read", "Grep", "Glob"):
+        assert tool_name in disallowed
+    for mcp_tool in ("rlm_start", "rlm_execute", "rlm_end"):
+        assert mcp_tool in body

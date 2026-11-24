@@ -8,16 +8,20 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
+from rlm_tools import llm_bridge
 from rlm_tools.llm_bridge import (
     DEFAULT_GEMINI_MODEL,
     DEFAULT_OPENAI_MODEL,
     _OpenAICompatClient,
     _normalize_openai_endpoint,
+    get_client,
     has_configured_provider,
     make_llm_query,
     make_llm_query_batched,
     resolve_provider,
 )
+
+_REAL_GET_CLIENT = get_client
 
 
 def test_llm_query_calls_anthropic():
@@ -307,3 +311,27 @@ def test_llm_query_openai_compat_transport_headers_retries_and_tokens(monkeypatc
             make_llm_query(client=client, deadline=lambda: expired)("hello")
     finally:
         client.close()
+
+
+def test_get_client_anthropic_requires_key_and_constructs_client(monkeypatch):
+    import anthropic
+
+    monkeypatch.setattr(llm_bridge, "get_client", _REAL_GET_CLIENT)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("RLM_SUB_PROVIDER", raising=False)
+
+    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
+        llm_bridge.get_client("anthropic")
+
+    constructed = {}
+
+    def fake_anthropic(*, api_key, max_retries):
+        constructed["api_key"] = api_key
+        constructed["max_retries"] = max_retries
+        return SimpleNamespace(messages=MagicMock())
+
+    monkeypatch.setattr(anthropic, "Anthropic", fake_anthropic)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    client = llm_bridge.get_client("anthropic")
+    assert hasattr(client, "messages")
+    assert constructed == {"api_key": "sk-ant-test", "max_retries": 0}

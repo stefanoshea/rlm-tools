@@ -2,7 +2,7 @@
 
 <!-- mcp-name: io.github.stefanoshea/rlm-tools -->
 
-RLM Tools gives coding agents a read-only Python sandbox for exploring a repository. An agent can search files, keep results in memory across calls, and return a count, a list of paths, or a short excerpt to the conversation. Local exploration needs no API key. Optional model helpers (`llm_query`, `rlm_recurse`) can send repository content to Anthropic, Gemini, or any OpenAI-compatible endpoint (OpenAI, OpenRouter, Ollama, vLLM, LM Studio) when you enable them for that workspace.
+RLM Tools gives coding agents a read-only Python sandbox for exploring a repository. An agent can search files, keep results in memory across calls, and return a count, a list of paths, or a short excerpt to the conversation. Local exploration needs no API key. Optional model helpers (`llm_query`, `rlm_recurse`) can send repository content to Anthropic, Gemini, any OpenAI-compatible endpoint (OpenAI, OpenRouter, Ollama, vLLM, LM Studio), or a logged-in local Claude Code CLI (`claude-cli`) when you enable them for that workspace.
 
 ## Plugins & Extensions
 
@@ -33,6 +33,8 @@ Open Claude Code in your repository and enter these commands at the Claude promp
 /plugin marketplace add stefanoshea/rlm-tools
 /plugin install rlm-tools@rlm-tools
 ```
+
+The plugin also bundles an `rlm-explorer` subagent (`model: haiku`, restricted to `rlm-tools`) so Claude Code subscribers get parallel, context-isolated sandboxed exploration out of the box. To also run programmatic `llm_query()` / `rlm_recurse()` calls inside sandbox Python scripts on your Claude subscription without an API key, see [Claude Code subscription (`claude-cli`)](#claude-code-subscription-claude-cli).
 
 ### Gemini CLI
 
@@ -129,8 +131,8 @@ The sandbox provides built-in helpers:
 - `grep(pattern)` / `grep_summary(pattern)` / `grep_read(pattern)` — Search
 - `glob_files(pattern)` — Find files by pattern
 - `tree(path, max_depth)` — Directory structure
-- `llm_query(prompt, context)` / `llm_query_batched(prompts, context)` — Sub-LLM analysis (optional, requires a provider key or `OPENAI_BASE_URL`)
-- `rlm_recurse(prompt, context)` / `rlm_recurse_batched(prompts, context)` — Ask a sub-agent to explore the session directory (optional, requires a provider key or `OPENAI_BASE_URL`)
+- `llm_query(prompt, context)` / `llm_query_batched(prompts, context)` — Sub-LLM analysis (optional, requires a provider key, `OPENAI_BASE_URL`, or `RLM_SUB_PROVIDER=claude-cli`)
+- `rlm_recurse(prompt, context)` / `rlm_recurse_batched(prompts, context)` — Ask a sub-agent to explore the session directory (optional, requires a provider key, `OPENAI_BASE_URL`, or `RLM_SUB_PROVIDER=claude-cli`)
 
 The sandbox allows only these imports: `re`, `json`, `collections`, `math`, `fnmatch`, `itertools`, `functools`, `operator`, `string`, `textwrap`, `difflib`, `statistics`. `os`, `glob`, `pathlib`, `ast`, `open()`, `exec()`, `eval()`, `getattr()`, and `str.format()` are blocked. Use the helpers and f-strings instead. `rlm_start` returns the current `allowed_imports` list.
 - `rlm_finalize(value)` — Return structured final output in `rlm_execute` responses
@@ -244,7 +246,7 @@ Then point your MCP client to `command: uv`, `args: ["--directory", "/path/to/rl
 
 Set these variables in the MCP **server** environment and restart the server after changing them. By default, the server allows exploration underneath its launch directory. If a client launches it from your home directory or the filesystem root, configure an explicit workspace. Multiple roots use the platform path separator (`:` on macOS and Linux).
 
-For example, this configuration permits local exploration of two repositories and enables sub-LLM helpers only for the second, when the server also has an Anthropic, Gemini, or OpenAI-compatible provider configured:
+For example, this configuration permits local exploration of two repositories and enables sub-LLM helpers only for the second, when the server also has an Anthropic, Gemini, OpenAI-compatible, or `claude-cli` provider configured:
 
 ```json
 {
@@ -253,7 +255,7 @@ For example, this configuration permits local exploration of two repositories an
 }
 ```
 
-A grant covers the named directory and its descendants. Keep private repositories outside roots granted external processing. The configured provider (Anthropic, Gemini, OpenAI, or any OpenAI-compatible Chat Completions endpoint such as OpenRouter, Ollama, LM Studio, or vLLM) receives the prompts, context, and tool results used by the model helpers. OpenAI-compatible support works out of the box with no extra dependencies. Enabling the optional evidence gate also sends the question and candidate excerpts to TypeSafe or Gemini (`gemini-decision-1`). Ordinary read, grep, glob, and tree operations require no provider and do not import provider SDKs at startup. Keep real credentials in your client's secret configuration or an environment file outside the explored checkout.
+A grant covers the named directory and its descendants. Keep private repositories outside roots granted external processing. The configured provider (Anthropic, Gemini, OpenAI, any OpenAI-compatible Chat Completions endpoint such as OpenRouter, Ollama, LM Studio, or vLLM, or the local `claude` CLI) receives the prompts, context, and tool results used by the model helpers. OpenAI-compatible support works out of the box with no extra dependencies. Enabling the optional evidence gate also sends the question and candidate excerpts to TypeSafe or Gemini (`gemini-decision-1`). Ordinary read, grep, glob, and tree operations require no provider and do not import provider SDKs at startup. Keep real credentials in your client's secret configuration or an environment file outside the explored checkout.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -263,18 +265,40 @@ A grant covers the named directory and its descendants. Keep private repositorie
 | `GEMINI_API_KEY` | — | Enables Gemini Interactions helpers and `gemini-decision-1` gate (`[gemini]` extra, Python 3.11+). |
 | `OPENAI_API_KEY` | — | Enables OpenAI (or OpenAI-compatible) `llm_query()` / `rlm_recurse()` helpers. |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Custom OpenAI-compatible Chat Completions base URL (supports keyless local Ollama/vLLM/LM Studio endpoints when set alone). |
-| `RLM_SUB_PROVIDER` | `auto` | Sub-LLM provider: `auto` (Anthropic, then Gemini, then OpenAI-compatible), `anthropic`, `gemini`, or `openai` (`openai-compatible`). |
+| `RLM_SUB_PROVIDER` | `auto` | Sub-LLM provider: `auto` (Anthropic, then Gemini, then OpenAI-compatible; never auto-selects `claude-cli`), `anthropic`, `gemini`, `openai` (`openai-compatible`), or `claude-cli` (`claude_cli`, `claude-code`). |
 | `TYPESAFE_API_KEY` | — | Credential for optional TypeSafe scoring. |
 | `TYPESAFE_DEFAULT_MODEL` | `jev-latest` | System One model used by the TypeSafe evidence gate. |
 | `RLM_GATE_PROVIDER` | `auto` | Gate provider: `auto` (TypeSafe if key set, else Gemini), `typesafe`, or `gemini`. |
 | `GEMINI_DECISION_MODEL` | `gemini-decision-1` | Gemini Decisions model used when `RLM_GATE_PROVIDER=gemini` (or `auto` with `GEMINI_API_KEY`). |
 | `RLM_RECURSE_GATE` | `0` | Set to `1` to enable evidence-gate scoring for external-enabled sessions. |
-| `RLM_SUB_MODEL` | `claude-haiku-4-5-20251001` / `gemini-3.5-flash-lite` / `gpt-4.1-mini` | Model used for `llm_query()` / `rlm_recurse()` (defaults by active provider). |
+| `RLM_SUB_MODEL` | `claude-haiku-4-5-20251001` / `gemini-3.5-flash-lite` / `gpt-4.1-mini` / `haiku` | Model used for `llm_query()` / `rlm_recurse()` (defaults by active provider). |
+| `RLM_CLI_MAX_CONCURRENCY` | `4` | Max concurrent `claude` subprocesses when `RLM_SUB_PROVIDER=claude-cli`. |
 | `RLM_SUB_TIMEOUT_SECONDS` | `60` | Per-request timeout for sub-LLM calls |
 | `RLM_SUB_MAX_RETRIES` | `3` | Retry attempts for transient sub-LLM failures |
 | `RLM_RECURSE_MAX_DEPTH` | `2` | Max recursion depth for `rlm_recurse()` child agents |
 | `RLM_MAX_SESSIONS` | `5` | Max concurrent sessions |
 | `RLM_SESSION_TIMEOUT` | `10` | Session timeout in minutes |
+
+### Claude Code subscription (`claude-cli`)
+
+To power `llm_query()` and `rlm_recurse()` from an existing Claude Code subscription login without an API key:
+
+1. Install [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and log in once with `claude` (confirm `claude --version` works on `PATH`).
+2. Set these variables on the `rlm-tools` MCP server (either in your MCP client config or via `claude mcp add`), pointing both roots at the parent directory or repository you want external helpers to inspect:
+
+```json
+{
+  "env": {
+    "RLM_SUB_PROVIDER": "claude-cli",
+    "RLM_ALLOWED_ROOTS": "/path/to/your/workspace",
+    "RLM_EXTERNAL_ROOTS": "/path/to/your/workspace"
+  }
+}
+```
+
+- **Explicit opt-in only:** `RLM_SUB_PROVIDER=claude-cli` (aliases `claude_cli`, `claude-code`) is never selected in `auto` mode.
+- **No token extraction:** `rlm-tools` never reads or passes your OAuth token. Instead, it runs `claude -p` as a subprocess with `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, and nested-session variables (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SSE_PORT`) stripped from the child environment, inside a temporary working directory with tools disabled, an empty strict MCP config (`{"mcpServers":{}}`), `--setting-sources ""`, and `--safe-mode`.
+- **Latency & usage limits:** Each call starts a new `claude -p` process (~1–2 seconds of startup overhead per call), so it is slower than direct API calls and counts toward your Claude subscription usage limits. When running `llm_query_batched()` or `rlm_recurse()`, pass a higher `execution_timeout_seconds` (for example `120`–`180`) to `rlm_start()`, and adjust `RLM_CLI_MAX_CONCURRENCY` (default `4`) or `RLM_SUB_MODEL` (default `haiku`) as needed.
 
 ## Security
 
