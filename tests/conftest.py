@@ -1,9 +1,9 @@
 """Test-wide guard against live model calls.
 
-Every semantic test injects a fake client. This fixture makes that the only
-possible path: the TypeSafe key is stripped from the environment and the real
-client factory raises, so a test that forgets to inject fails loudly instead of
-quietly spending tokens.
+Every semantic and sub-LLM test injects a fake client. This fixture makes that
+the only possible path: provider keys are stripped from the environment and the
+real client factories raise, so a test that forgets to inject fails loudly
+instead of quietly spending tokens.
 """
 
 import os
@@ -37,6 +37,12 @@ def external_test_roots(monkeypatch, test_workspace_roots):
 def no_live_model_calls(monkeypatch):
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("RLM_SUB_PROVIDER", raising=False)
+    monkeypatch.delenv("RLM_GATE_PROVIDER", raising=False)
 
     def _blocked(*args, **kwargs):
         raise RuntimeError("live model calls are disabled in tests; inject a client")

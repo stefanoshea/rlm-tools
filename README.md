@@ -74,7 +74,7 @@ for module, ms in sorted(by_module.items(), key=lambda x: -len(x[1]))[:5]:
 
 On the four checked-in Python and TypeScript fixture tasks, the RLM scripts used **13.6% to 54.5% fewer estimated context characters** than the baseline file and search operations. The estimate counts script or tool arguments, returned text, and 350 characters of overhead per measured turn. It excludes session startup and teardown. Run `uv run --extra dev python -m pytest evals/test_comparative.py -q -s` for the per-task counts. The prompt benchmark measures root-agent token usage and answer quality separately.
 
-In heavy exploration tasks (reading many files, broad searches), savings go much further. The table below is a **worst-case** comparison: the "Standard Tools" baseline dumps full grep/file payloads into context, which is the upper bound on what naive tool use costs — a careful agent dumps less. Treat these as the ceiling on savings, not the typical case, and look at the [scored evals](#scored-evals) for whether answer quality holds up at those reductions.
+In heavy exploration tasks (reading many files, broad searches, multi-file aggregation), savings go much further: on the live Gemini 230-file (`heavy`) A/B benchmark (`gemini-3.5-flash-lite`), `rlm-tools` achieved **100% pass vs 40%–60% for native tools** with **87.3%–90.1% fewer tokens** (`31,208` vs `315,676` post-fix tokens). Conversely, on narrow 1–5 file lookups in small (~28 KB) repositories (`long_context`), native `Read`/`Grep`/`Glob` uses ~2.5× fewer tokens because MCP session lifecycle adds fixed overhead. Route narrow lookups to native tools and use `rlm-tools` for broad searches, audits, large files, and multi-step analysis. The table below is a **worst-case** comparison where the "Standard Tools" baseline dumps full grep/file payloads into context; treat it as an upper bound and see [`docs/benchmarks.md`](docs/benchmarks.md) plus [scored evals](#scored-evals) for full measured results and crossover guidance.
 
 | Scenario | Standard Tools | RLM Tools | Saved |
 |---|---:|---:|---:|
@@ -108,9 +108,9 @@ Three MCP tools. That's the entire API:
 
 | Tool | Purpose |
 |---|---|
-| `rlm_start(path, query)` | Open a session on a directory |
-| `rlm_execute(session_id, code)` | Run Python in the sandbox |
-| `rlm_end(session_id)` | Close session, free resources |
+| `rlm_start(path, query, code?)` | Open a session on a directory (optionally run initial code immediately) |
+| `rlm_execute(session_id, code, end_session?)` | Run Python in the sandbox (set `end_session=true` on the final step to close) |
+| `rlm_end(session_id)` | Explicitly close session and free resources |
 
 The sandbox provides built-in helpers:
 
@@ -145,9 +145,7 @@ judge, a flat score distribution, or an exhaustive question (`every`, `all`, `li
 all return the original text untouched — exhaustive questions need every mention, and
 relevance scores cannot tell the last one from noise.
 
-The gate uses [TypeSafe](https://typesafe.ai) System One models. To enable it, run
-the server with the semantic extra (`uvx --from 'rlm-tools[semantic]' rlm-tools`)
-and pass both API keys, set `RLM_RECURSE_GATE=1`, and include the repository in `RLM_EXTERNAL_ROOTS`. TypeSafe receives the question and candidate excerpts, including excerpts the gate later drops.
+The gate supports [TypeSafe](https://typesafe.ai) System One models (`uvx --from 'rlm-tools[semantic]' rlm-tools` with `TYPESAFE_API_KEY`) or Google's Decisions API (`uvx --from 'rlm-tools[gemini]' rlm-tools` with `GEMINI_API_KEY` and `gemini-decision-1`, requires Python 3.11+). To enable it, pass a sub-LLM key and scorer key (a single `GEMINI_API_KEY` can power both), set `RLM_RECURSE_GATE=1`, and include the repository in `RLM_EXTERNAL_ROOTS`. The configured provider receives the question and candidate excerpts, including excerpts the gate later drops.
 
 ## Works With
 
@@ -226,7 +224,7 @@ Then point your MCP client to `command: uv`, `args: ["--directory", "/path/to/rl
 
 Set these variables in the MCP **server** environment and restart the server after changing them. By default, the server allows exploration underneath its launch directory. If a client launches it from your home directory or the filesystem root, configure an explicit workspace. Multiple roots use the platform path separator (`:` on macOS and Linux).
 
-For example, this configuration permits local exploration of two repositories and enables Anthropic helpers only for the second, when the server also has an Anthropic key:
+For example, this configuration permits local exploration of two repositories and enables sub-LLM helpers only for the second, when the server also has an Anthropic, Gemini, or OpenAI-compatible provider configured:
 
 ```json
 {
@@ -235,17 +233,23 @@ For example, this configuration permits local exploration of two repositories an
 }
 ```
 
-A grant covers the named directory and its descendants. Keep private repositories outside roots granted external processing. Anthropic receives the prompts, context, and tool results used by the model helpers. Enabling the optional TypeSafe gate also sends the question and candidate excerpts to TypeSafe. Ordinary read, grep, glob, and tree operations require no provider. Keep real credentials in your client's secret configuration or an environment file outside the explored checkout.
+A grant covers the named directory and its descendants. Keep private repositories outside roots granted external processing. The configured provider (Anthropic, Gemini, OpenAI, or any OpenAI-compatible Chat Completions endpoint such as OpenRouter, Ollama, LM Studio, or vLLM) receives the prompts, context, and tool results used by the model helpers. OpenAI-compatible support works out of the box with no extra dependencies. Enabling the optional evidence gate also sends the question and candidate excerpts to TypeSafe or Gemini (`gemini-decision-1`). Ordinary read, grep, glob, and tree operations require no provider and do not import provider SDKs at startup. Keep real credentials in your client's secret configuration or an environment file outside the explored checkout.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RLM_ALLOWED_ROOTS` | Server launch directory, except home or filesystem root | Absolute directories the operator permits sessions to explore. An explicitly empty list denies all roots. |
 | `RLM_EXTERNAL_ROOTS` | Empty | Subset of allowed directories eligible for external model helpers. |
 | `ANTHROPIC_API_KEY` | — | Enables Anthropic model helpers for external-enabled sessions. |
+| `GEMINI_API_KEY` | — | Enables Gemini Interactions helpers and `gemini-decision-1` gate (`[gemini]` extra, Python 3.11+). |
+| `OPENAI_API_KEY` | — | Enables OpenAI (or OpenAI-compatible) `llm_query()` / `rlm_recurse()` helpers. |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Custom OpenAI-compatible Chat Completions base URL (supports keyless local Ollama/vLLM/LM Studio endpoints when set alone). |
+| `RLM_SUB_PROVIDER` | `auto` | Sub-LLM provider: `auto` (Anthropic, then Gemini, then OpenAI-compatible), `anthropic`, `gemini`, or `openai` (`openai-compatible`). |
 | `TYPESAFE_API_KEY` | — | Credential for optional TypeSafe scoring. |
-| `TYPESAFE_DEFAULT_MODEL` | `jev-latest` | System One model used by the evidence gate |
-| `RLM_RECURSE_GATE` | `0` | Set to `1` to enable TypeSafe scoring for external-enabled Anthropic sessions. |
-| `RLM_SUB_MODEL` | `claude-haiku-4-5-20251001` | Claude model used for `llm_query()`/`rlm_recurse()` |
+| `TYPESAFE_DEFAULT_MODEL` | `jev-latest` | System One model used by the TypeSafe evidence gate. |
+| `RLM_GATE_PROVIDER` | `auto` | Gate provider: `auto` (TypeSafe if key set, else Gemini), `typesafe`, or `gemini`. |
+| `GEMINI_DECISION_MODEL` | `gemini-decision-1` | Gemini Decisions model used when `RLM_GATE_PROVIDER=gemini` (or `auto` with `GEMINI_API_KEY`). |
+| `RLM_RECURSE_GATE` | `0` | Set to `1` to enable evidence-gate scoring for external-enabled sessions. |
+| `RLM_SUB_MODEL` | `claude-haiku-4-5-20251001` / `gemini-3.5-flash-lite` / `gpt-4.1-mini` | Model used for `llm_query()` / `rlm_recurse()` (defaults by active provider). |
 | `RLM_SUB_TIMEOUT_SECONDS` | `60` | Per-request timeout for sub-LLM calls |
 | `RLM_SUB_MAX_RETRIES` | `3` | Retry attempts for transient sub-LLM failures |
 | `RLM_RECURSE_MAX_DEPTH` | `2` | Max recursion depth for `rlm_recurse()` child agents |

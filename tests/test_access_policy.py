@@ -67,6 +67,7 @@ def test_local_session_never_initializes_providers(tmp_path, monkeypatch):
     from rlm_tools import server
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
     monkeypatch.setenv("RLM_RECURSE_GATE", "1")
     with patch.object(server, "make_scorer") as scorer, patch.object(server, "make_llm_query") as provider:
@@ -74,6 +75,35 @@ def test_local_session_never_initializes_providers(tmp_path, monkeypatch):
         try:
             assert not any("llm_query" in name for name in started["available_functions"])
             scorer.assert_not_called()
+            provider.assert_not_called()
+        finally:
+            server._rlm_end(started["session_id"])
+
+
+def test_gemini_key_alone_does_not_grant_egress(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("RLM_ALLOWED_ROOTS")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    policy = workspace_policy()
+    assert policy.authorize(".") == tmp_path.resolve()
+    assert not policy.allows_external(tmp_path)
+
+
+def test_openai_config_alone_does_not_grant_egress_or_init_providers(tmp_path, monkeypatch):
+    from rlm_tools import server
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("RLM_ALLOWED_ROOTS", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
+    policy = workspace_policy()
+    assert policy.authorize(".") == tmp_path.resolve()
+    assert not policy.allows_external(tmp_path)
+
+    with patch.object(server, "make_llm_query") as provider:
+        started = json.loads(server._rlm_start(str(tmp_path), "local only"))
+        try:
+            assert not any("llm_query" in name for name in started["available_functions"])
             provider.assert_not_called()
         finally:
             server._rlm_end(started["session_id"])
