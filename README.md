@@ -2,11 +2,11 @@
 
 <!-- mcp-name: io.github.stefanoshea/rlm-tools -->
 
-RLM Tools gives coding agents a read-only Python sandbox for exploring a repository. An agent can search files, keep results in memory across calls, and return a count, a list of paths, or a short excerpt to the conversation. Local exploration needs no API key. Optional model helpers can send repository content to an external provider when you enable them for that workspace.
+RLM Tools gives coding agents a read-only Python sandbox for exploring a repository. An agent can search files, keep results in memory across calls, and return a count, a list of paths, or a short excerpt to the conversation. Local exploration needs no API key. Optional model helpers (`llm_query`, `rlm_recurse`) can send repository content to Anthropic, Gemini, or any OpenAI-compatible endpoint (OpenAI, OpenRouter, Ollama, vLLM, LM Studio) when you enable them for that workspace.
 
 ## Plugins & Extensions
 
-The 0.1.3 plugins register the MCP server and install the `rlm-explore` skill for Codex CLI, Claude Code, and Gemini CLI. The server runs on macOS and Linux and requires `uvx` on the client's `PATH`. Run `uvx --version` in your terminal to check. Linux also requires `libseccomp.so.2`. [Release notes](https://github.com/stefanoshea/rlm-tools/releases/tag/v0.1.3) · [Install uv](https://docs.astral.sh/uv/getting-started/installation/)
+The plugins register the MCP server and install the `rlm-explore` skill for Codex CLI, Claude Code, and Gemini CLI. The server runs on macOS and Linux and requires `uvx` on the client's `PATH`. Run `uvx --version` in your terminal to check. Linux also requires `libseccomp.so.2`. [Release notes](https://github.com/stefanoshea/rlm-tools/releases) · [Install uv](https://docs.astral.sh/uv/getting-started/installation/)
 
 For Cursor, VS Code, Kiro, and standalone MCP setup, see [other clients and installation methods](#other-clients).
 
@@ -50,7 +50,7 @@ Try this prompt in the client you just configured.
 
 > Use RLM Tools to list the top-level directories in this repository, then close the session.
 
-The agent should call `rlm_start`, run `tree(max_depth=1)` through `rlm_execute`, and finish with `rlm_end`. If startup returns `Directory outside RLM_ALLOWED_ROOTS`, check that the MCP server received the absolute path to your checkout. [Workspace configuration](#configuration)
+The agent should call `rlm_start`, run `tree(max_depth=1)` through `rlm_execute`, and close the session, ideally by passing `end_session=true` on that last `rlm_execute` call (a separate `rlm_end` also works). If startup returns `Directory outside RLM_ALLOWED_ROOTS`, check that the MCP server received the absolute path to your checkout. [Workspace configuration](#configuration)
 
 ## What Changes
 
@@ -74,7 +74,18 @@ for module, ms in sorted(by_module.items(), key=lambda x: -len(x[1]))[:5]:
 
 On the four checked-in Python and TypeScript fixture tasks, the RLM scripts used **13.6% to 54.5% fewer estimated context characters** than the baseline file and search operations. The estimate counts script or tool arguments, returned text, and 350 characters of overhead per measured turn. It excludes session startup and teardown. Run `uv run --extra dev python -m pytest evals/test_comparative.py -q -s` for the per-task counts. The prompt benchmark measures root-agent token usage and answer quality separately.
 
-In heavy exploration tasks (reading many files, broad searches, multi-file aggregation), savings go much further: on the live Gemini 230-file (`heavy`) A/B benchmark (`gemini-3.5-flash-lite`), `rlm-tools` achieved **100% pass vs 40%–60% for native tools** with **87.3%–90.1% fewer tokens** (`31,208` vs `315,676` post-fix tokens). Conversely, on narrow 1–5 file lookups in small (~28 KB) repositories (`long_context`), native `Read`/`Grep`/`Glob` uses ~2.5× fewer tokens because MCP session lifecycle adds fixed overhead. Route narrow lookups to native tools and use `rlm-tools` for broad searches, audits, large files, and multi-step analysis. The table below is a **worst-case** comparison where the "Standard Tools" baseline dumps full grep/file payloads into context; treat it as an upper bound and see [`docs/benchmarks.md`](docs/benchmarks.md) plus [scored evals](#scored-evals) for full measured results and crossover guidance.
+Live paired A/B runs against Gemini (`gemini-3.5-flash-lite`, exact JSON grading) show where the tool wins and where it does not:
+
+| Repository | Arm | Pass rate | Mean tokens |
+|---|---|---:|---:|
+| 230 files, 1.28 MB (`heavy`, 5 tasks) | Native `Read`/`Grep`/`Glob` | 60% (3/5) | 315,676 |
+| 230 files, 1.28 MB (`heavy`, 5 tasks) | RLM Tools | **100% (5/5)** | **31,208** (−90.1%) |
+| ~28 KB (`long_context`, 11 tasks) | Native `Read`/`Grep`/`Glob` | **100% (11/11)** | **23,464** |
+| ~28 KB (`long_context`, 11 tasks) | RLM Tools | 81.8% (9/11) | 58,986 |
+
+The `heavy` row is the 2026-11-24 run after the sandbox-contract and `end_session` changes; an earlier run of the same tasks measured native tools at 40% pass and 469,392 tokens against RLM Tools at 100% and 59,389 (−87.3%). The `long_context` row predates those changes, and a later re-run only completed 5 of 11 pairs before hitting a provider quota, so treat it as a baseline. On narrow lookups in small repositories, native tools use about 2.5× fewer tokens because opening and closing a session adds fixed overhead. Route narrow lookups to native tools and use RLM Tools for broad searches, audits, large files, and multi-step analysis; `rlm-tools-setup --write-policy` writes that guidance into `AGENTS.md` or `CLAUDE.md`.
+
+The table below is a **worst-case** comparison where the "Standard Tools" baseline dumps full grep/file payloads into context; treat it as an upper bound and see [`docs/benchmarks.md`](docs/benchmarks.md) plus [scored evals](#scored-evals) for full measured results and crossover guidance.
 
 | Scenario | Standard Tools | RLM Tools | Saved |
 |---|---:|---:|---:|
@@ -118,8 +129,10 @@ The sandbox provides built-in helpers:
 - `grep(pattern)` / `grep_summary(pattern)` / `grep_read(pattern)` — Search
 - `glob_files(pattern)` — Find files by pattern
 - `tree(path, max_depth)` — Directory structure
-- `llm_query(prompt, context)` / `llm_query_batched(prompts, context)` — Sub-LLM analysis (optional, requires API key)
-- `rlm_recurse(prompt, context)` / `rlm_recurse_batched(prompts, context)` — Ask a sub-agent to explore the session directory (optional, requires API key)
+- `llm_query(prompt, context)` / `llm_query_batched(prompts, context)` — Sub-LLM analysis (optional, requires a provider key or `OPENAI_BASE_URL`)
+- `rlm_recurse(prompt, context)` / `rlm_recurse_batched(prompts, context)` — Ask a sub-agent to explore the session directory (optional, requires a provider key or `OPENAI_BASE_URL`)
+
+The sandbox allows only these imports: `re`, `json`, `collections`, `math`, `fnmatch`, `itertools`, `functools`, `operator`, `string`, `textwrap`, `difflib`, `statistics`. `os`, `glob`, `pathlib`, `ast`, `open()`, `exec()`, `eval()`, `getattr()`, and `str.format()` are blocked. Use the helpers and f-strings instead. `rlm_start` returns the current `allowed_imports` list.
 - `rlm_finalize(value)` — Return structured final output in `rlm_execute` responses
 
 Variables persist across `rlm_execute` calls within a session. The agent can build up understanding incrementally — search, filter, read, analyze — without any intermediate data touching the context window.
@@ -137,8 +150,15 @@ server.py           15,924 -> 1,491 chars   1 of 11 chunks kept
 helpers.py           9,200 -> 3,193 chars   2 of 7 chunks kept
 ```
 
-81% of bytes dropped across those reads with every answer still intact. Scoring is
-batched, so judging a dozen chunks costs about what judging one costs.
+81% of bytes dropped across those reads with every answer still intact. In a later
+direct check with Google's `gemini-decision-1` on three source files (`llm_bridge.py`,
+`helpers.py`, `server.py`), the gate dropped 91% of characters (73,068 to 6,381) with every
+answer surviving, at roughly one second per gate call. These are single-file measurements of
+the gate itself. The gate is off by default and was not enabled in the benchmark runs above.
+
+Chunks are split at 40 lines or 2,400 characters, whichever comes first, and each chunk is
+sent to the scorer in full. Scoring is batched (12 chunks per request), so judging a dozen
+chunks costs one request.
 
 The gate fails open. A scoring error, an exhausted call budget, a result too small to
 judge, a flat score distribution, or an exhaustive question (`every`, `all`, `list`)
