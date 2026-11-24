@@ -30,7 +30,7 @@ DEFAULT_MODEL = "jev-latest"
 DEFAULT_GEMINI_MODEL = "gemini-decision-1"
 DEFAULT_CHUNK_SIZE = 12
 DEFAULT_MAX_WORKERS = 4
-DEFAULT_MAX_ITEM_CHARS = 600
+DEFAULT_MAX_ITEM_CHARS = 2_400
 
 DEFAULT_GATE_THRESHOLD = 0.45
 DEFAULT_GATE_CHUNK_LINES = 40
@@ -201,6 +201,8 @@ def make_scorer(
         raise ValueError("chunk_size must be >= 1")
     if max_workers < 1:
         raise ValueError("max_workers must be >= 1")
+    if max_item_chars < 1:
+        raise ValueError("max_item_chars must be >= 1")
     if client is not None:
         if hasattr(client, "decisions") and not hasattr(client, "system_one"):
             decision_model = model or os.environ.get("GEMINI_DECISION_MODEL") or DEFAULT_GEMINI_MODEL
@@ -252,12 +254,33 @@ def make_scorer(
     return score_all
 
 
-def _split_chunks(text: str, chunk_lines: int) -> list[str]:
+def _split_chunks(
+    text: str,
+    chunk_lines: int,
+    max_chunk_chars: int | None = None,
+) -> list[str]:
+    """Split text into chunks capped by both line count and character length."""
     lines = text.splitlines()
-    return [
-        "\n".join(lines[i:i + chunk_lines])
-        for i in range(0, len(lines), chunk_lines)
-    ]
+    if not lines:
+        return []
+    chunks: list[str] = []
+    buf: list[str] = []
+    buf_chars = 0
+    for line in lines:
+        added = len(line) + (1 if buf else 0)
+        if buf and (
+            len(buf) >= chunk_lines
+            or (max_chunk_chars is not None and buf_chars + added > max_chunk_chars)
+        ):
+            chunks.append("\n".join(buf))
+            buf = [line]
+            buf_chars = len(line)
+        else:
+            buf.append(line)
+            buf_chars += added
+    if buf:
+        chunks.append("\n".join(buf))
+    return chunks
 
 
 def make_evidence_gate(
@@ -267,6 +290,7 @@ def make_evidence_gate(
     min_chars: int = DEFAULT_GATE_MIN_CHARS,
     min_separation: float = DEFAULT_GATE_MIN_SEPARATION,
     on_gate: Callable[[dict], None] | None = None,
+    max_chunk_chars: int | None = DEFAULT_MAX_ITEM_CHARS,
 ) -> Callable[[str, str], str]:
     """Build a gate that drops tool output unrelated to the question.
 
@@ -277,6 +301,10 @@ def make_evidence_gate(
     ``on_gate`` receives one record per call, so a run can measure what the gate
     dropped and whether the answer survived it.
     """
+    if chunk_lines < 1:
+        raise ValueError("chunk_lines must be >= 1")
+    if max_chunk_chars is not None and max_chunk_chars < 1:
+        raise ValueError("max_chunk_chars must be >= 1")
 
     def _record(**fields) -> None:
         if on_gate is not None:
@@ -293,7 +321,7 @@ def make_evidence_gate(
             _record(outcome="passed_through_exhaustive", chars_in=len(text), chars_out=len(text))
             return text
 
-        chunks = _split_chunks(text, chunk_lines)
+        chunks = _split_chunks(text, chunk_lines, max_chunk_chars=max_chunk_chars)
         if len(chunks) < 2:
             _record(outcome="passed_through", chars_in=len(text), chars_out=len(text))
             return text

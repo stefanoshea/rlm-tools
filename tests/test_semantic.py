@@ -163,3 +163,22 @@ def test_gemini_decisions_scorer_and_evidence_gate():
     gated = gate("what does keep do?", text)
     assert "keep line" in gated
     assert "noise line" not in gated
+
+
+def test_make_scorer_rejects_invalid_max_item_chars():
+    with pytest.raises(ValueError, match="max_item_chars"):
+        make_scorer(client=FakeClient(), max_item_chars=0)
+
+
+def test_default_scorer_sees_signal_late_in_40_line_chunk():
+    padding = ["padding line " + ("x" * 28) for _ in range(29)]
+    chunk_with_late_match = "\n".join([*padding, "target = 'match'", *(["tail line"] * 10)])
+    unrelated_chunk = "\n".join(["noise line " + ("y" * 20) for _ in range(40)])
+    text = f"{chunk_with_late_match}\n{unrelated_chunk}"
+
+    scorer = make_scorer(client=FakeClient())
+    gate = make_evidence_gate(scorer, min_chars=10)
+    gated = gate("what is target set to?", text)
+
+    assert "target = 'match'" in gated
+    assert "noise line" not in gated

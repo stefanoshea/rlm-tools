@@ -243,3 +243,54 @@ def test_boolean_scores_fail_open_and_return_original_text():
 
     assert gate("what does this do?", text) is text
     assert records[0]["outcome"] == "failed_open"
+
+
+def test_dense_lines_split_cleanly_at_max_chunk_chars():
+    seen_chunks: list[str] = []
+
+    def score_all(items, question):
+        seen_chunks.extend(items)
+        return [0.9 if "keep" in item else 0.1 for item in items]
+
+    # 10 lines of 30 chars each -> ~310 chars total, well under 40 lines but > 120 chars.
+    lines = [f"keep line {i:02d} " + ("x" * 17) for i in range(6)] + [
+        f"drop line {i:02d} " + ("y" * 17) for i in range(6)
+    ]
+    text = "\n".join(lines)
+
+    gate = make_evidence_gate(score_all, chunk_lines=40, max_chunk_chars=120, min_chars=10)
+    gated = gate("which lines keep?", text)
+
+    assert len(seen_chunks) >= 4
+    assert all(len(chunk) <= 120 for chunk in seen_chunks)
+    for i in range(6):
+        assert f"keep line {i:02d}" in gated
+        assert f"drop line {i:02d}" not in gated
+
+    # When every split chunk is relevant, nothing is dropped.
+    all_keep = "\n".join(f"keep line {i:02d} " + ("x" * 17) for i in range(8))
+    assert gate("which lines keep?", all_keep) is all_keep
+
+
+def test_single_long_line_is_emitted_without_splitting_mid_line():
+    seen_chunks: list[str] = []
+
+    def score_all(items, question):
+        seen_chunks.extend(items)
+        return [0.9 if "keep" in item else 0.1 for item in items]
+
+    long_keep = "keep_" + ("z" * 150)
+    noise = "noise_" + ("q" * 150)
+    gate = make_evidence_gate(score_all, chunk_lines=40, max_chunk_chars=80, min_chars=10)
+    gated = gate("find keep", f"{long_keep}\n{noise}")
+
+    assert seen_chunks == [long_keep, noise]
+    assert long_keep in gated
+    assert noise not in gated
+
+
+def test_make_evidence_gate_rejects_invalid_chunk_limits():
+    with pytest.raises(ValueError, match="chunk_lines"):
+        make_evidence_gate(lambda items, q: [0.5] * len(items), chunk_lines=0)
+    with pytest.raises(ValueError, match="max_chunk_chars"):
+        make_evidence_gate(lambda items, q: [0.5] * len(items), max_chunk_chars=0)
