@@ -3,7 +3,7 @@
   "name": "io.github.stefanoshea/rlm-tools",
   "title": "RLM Tools",
   "description": "Persistent Python sandbox for token-efficient codebase exploration in MCP clients",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "websiteUrl": "https://github.com/stefanoshea/rlm-tools",
   "repository": {
     "url": "https://github.com/stefanoshea/rlm-tools",
@@ -13,7 +13,7 @@
     {
       "registryType": "pypi",
       "identifier": "rlm-tools",
-      "version": "0.2.2",
+      "version": "0.2.3",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
