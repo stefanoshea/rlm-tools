@@ -114,14 +114,85 @@ Optional env vars for A/B script:
 
 ## Spend Policy
 
-Unit tests and evals never call the TypeSafe API. `tests/conftest.py` and
-`evals/conftest.py` strip `TYPESAFE_API_KEY` and replace the client factory with one
-that raises, so a suite that reaches for Jev fails instead of billing. `run_ab_eval.sh`
-does the same for the MCP server it spawns, and sets `RLM_RECURSE_GATE=0`, unless the
-run opts in with `RLM_AB_SEMANTIC=1`.
+Unit tests and evals never call external model APIs. `tests/conftest.py` and
+`evals/conftest.py` strip `TYPESAFE_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
+`GOOGLE_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `RLM_SUB_PROVIDER`, and
+`RLM_GATE_PROVIDER`, and replace both `semantic.get_client` and
+`llm_bridge.get_client` with functions that raise, so any test that reaches for a
+provider fails instead of billing. `run_ab_eval.sh` and `run_gemini_ab_eval.py` also
+sanitize credentials passed to the spawned MCP server and keep `RLM_RECURSE_GATE=0`
+unless explicitly enabled.
 
 Spending belongs in the tool itself and in manual verification of the tool, not in the
 suites that run on every change.
+
+## Live Gemini A/B Benchmarks
+
+[`evals/run_gemini_ab_eval.py`](../evals/run_gemini_ab_eval.py) runs paired live A/B
+evaluations against the Gemini Interactions API (`google-genai>=3.2.0`, requires
+Python 3.11+ via the `gemini` extra), comparing the `rlm-tools` stdio MCP server against
+scoped native `read_file` / `grep` / `glob_files` tools using the exact same grading specs:
+
+```bash
+# Heavy 230-file / 1.28 MB synthetic corpus + long-context fixture suite
+uv run --locked --extra gemini python -m evals.run_gemini_ab_eval \
+  --suite both --model gemini-3.5-flash-lite \
+  --concurrency 1 --pace-seconds 4 --request-timeout 90
+
+# Individual suites: --suite heavy | --suite long_context
+```
+
+- `evals/heavy_corpus.py` generates a deterministic 230-file (~1.28 MB) Python codebase
+  combining 200 service modules, 10 ~58 KB monolith modules, 12 shared utilities, and
+  config files with five `json_equals` cases (`broad_service_inventory`,
+  `flag_and_route_audit`, `large_module_audit`, `shared_utility_fanin`,
+  `targeted_billing_trace`).
+- `long_context` runs the 11 checked-in cases in `evals/specs/rlm_long_context.json`
+  against `tests/fixtures/rlm_corpus_longcontext` (~28 KB).
+
+### Measured Before vs. After Results (`gemini-3.5-flash-lite`)
+
+Baseline runs (`2026-11-23`) were compared against post-fix runs (`2026-11-24`) after
+adding the explicit sandbox contract to tool schemas, lazy-importing `anthropic`
+(~1.5s to 0.280s warm import), and adding `end_session` + initial `code` support:
+
+| Suite & Scope | Run Date | Arm | Pass Rate | Mean Total Tokens | Mean Duration | Tool Calls | `rlm_end` Replay Tokens |
+|---|---|---|---:|---:|---:|---:|---:|
+| `heavy` (5/5 pairs) | 2026-11-23 (before) | `with_rlm` | 100.0% (5/5) | 59,388.6 | 69.6s | 50 | 47,912 |
+| `heavy` (5/5 pairs) | 2026-11-23 (before) | `without_rlm` | 40.0% (2/5) | 469,392.2 | 152.2s | 61 | 0 |
+| `heavy` (5/5 pairs) | 2026-11-24 (after) | `with_rlm` | **100.0% (5/5)** | **31,208.0 (-47.5%)** | 121.6s | **22 (-56.0%)** | **0** |
+| `heavy` (5/5 pairs) | 2026-11-24 (after) | `without_rlm` | 60.0% (3/5) | 315,676.2 | 95.6s | 71 | 0 |
+| `long_context` (11/11 pairs) | 2026-11-23 (before) | `with_rlm` | 81.8% (9/11) | 58,985.8 | 57.0s | 93 | 59,223 |
+| `long_context` (11/11 pairs) | 2026-11-23 (before) | `without_rlm` | 100.0% (11/11) | 23,463.6 | 39.4s | 72 | 0 |
+| `long_context` (matched 5/11) | 2026-11-23 (before) | `with_rlm` | 100.0% (5/5) | 20,885.8 | 66.8s | 32 | 20,953 |
+| `long_context` (matched 5/11) | 2026-11-24 (after, partial*) | `with_rlm` | 80.0% (4/5) | 18,945.4 (-9.3%) | 57.1s | 24 (-25.0%) | 0 |
+| `long_context` (matched 5/11) | 2026-11-24 (after, partial*) | `without_rlm` | 100.0% (5/5) | 8,210.4 | 30.3s | 20 | 0 |
+
+\*The post-fix `long_context` run completed the first 5/11 pairs before hitting the Free
+Tier `gemini-3.5-flash-lite` 500 requests/day quota limit on case 6 (`refund_notification_channel`);
+post-fix `heavy` mean duration (`121.6s`) reflects transient HTTP 503 retries during that run.
+Traces from the post-fix runs also showed that exposing `end_session` on `rlm_start` led the
+model to prematurely close Turn-1 sessions and call `rlm_start` repeatedly in 4 of the 5 partial
+`long_context` cases; `end_session` was subsequently restricted to `rlm_execute` while keeping
+optional initial `code` on `rlm_start`.
+
+A follow-up post-refinement check on `gemini-3.5-flash` (which routes to `gemini-3.6-flash`
+at a 20 RPD Free Tier limit) verified the updated flow end-to-end on
+`heavy/broad_service_inventory`: `with_rlm` passed (`48,828` tokens, 10 turns / 9 tool calls,
+0 blocked-import errors, 0 repeated `rlm_start` calls, and clean session close via
+`rlm_execute(..., end_session=True)`) before `without_rlm` exhausted the 20 RPD cap on turn 6.
+For full multi-case Free Tier benchmark runs (`heavy` + `long_context`), use
+`gemini-3.5-flash-lite` (500 RPD limit).
+
+### Crossover Guidance
+
+- **Where `rlm-tools` wins decisively**: broad multi-file inventories, flag/route audits,
+  fan-in aggregations, and scanning large files (`heavy`: **100% pass vs 40%–60%**,
+  **87.3%–90.1% fewer tokens** than native tools). Native `grep`/`read_file` overflows
+  small/medium context windows or loses accuracy under heavy output truncation.
+- **Where native `Read`/`Grep`/`Glob` wins**: narrow 1–5 file lookups and small traces
+  inside ~28 KB repos (`long_context`: **100% pass, ~2.5× fewer tokens** for native tools),
+  where `rlm-tools` session lifecycle and code-writing turns add fixed overhead.
 
 ## Benchmarking Against Your Own Repo
 

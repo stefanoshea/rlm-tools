@@ -48,7 +48,11 @@ def test_upsert_policy_block_appends_when_missing():
     updated = upsert_policy_block(existing)
     assert POLICY_START in updated
     assert POLICY_END in updated
-    assert "prefer `rlm-tools` over standard read/grep/glob tools" in updated
+    assert "Choose the exploration tool based on task shape" in updated
+    assert "broad searches" in updated
+    assert "narrow lookups" in updated
+    assert "end_session=true" in updated
+    assert "do not import `os`, `glob`, `pathlib`, or `ast`" in updated
 
 
 def test_upsert_policy_block_replaces_existing():

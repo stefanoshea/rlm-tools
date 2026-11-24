@@ -15,6 +15,12 @@ def no_live_model_calls(monkeypatch):
     """Offline evals must inject model clients."""
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("RLM_SUB_PROVIDER", raising=False)
+    monkeypatch.delenv("RLM_GATE_PROVIDER", raising=False)
     monkeypatch.setenv("RLM_RECURSE_GATE", "0")
 
     def _blocked(*args, **kwargs):

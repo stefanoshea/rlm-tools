@@ -3,8 +3,17 @@ their items, and charge every request against the session budget. All tests
 inject a fake System One client so the suite stays offline."""
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
-from rlm_tools.semantic import make_scorer
+import pytest
+
+from rlm_tools.semantic import (
+    DEFAULT_GEMINI_MODEL,
+    has_configured_scorer,
+    make_evidence_gate,
+    make_scorer,
+    resolve_provider,
+)
 
 
 @dataclass
@@ -86,3 +95,57 @@ def test_empty_input_costs_nothing():
 
     assert make_scorer(client=client)([], "relevant") == []
     assert client.calls == []
+
+
+def test_resolve_and_has_configured_scorer(monkeypatch):
+    assert resolve_provider() == "typesafe"
+    assert not has_configured_scorer()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+    assert resolve_provider() == "gemini"
+    assert has_configured_scorer()
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "t-key")
+    assert resolve_provider() == "typesafe"
+    assert resolve_provider("gemini") == "gemini"
+
+    monkeypatch.setenv("RLM_GATE_PROVIDER", "gemini")
+    assert resolve_provider() == "gemini"
+
+    monkeypatch.delenv("GEMINI_API_KEY")
+    assert not has_configured_scorer()
+
+    with pytest.raises(ValueError):
+        resolve_provider("unknown")
+
+
+def test_gemini_decisions_scorer_and_evidence_gate():
+    calls = []
+
+    class DynamicDecisions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            import json as _json
+
+            parsed = _json.loads(kwargs["input"])
+            return SimpleNamespace(
+                answers={
+                    f"c{idx}": SimpleNamespace(noul=0.9 if "keep" in text else 0.1)
+                    for idx, text in parsed["candidates"].items()
+                }
+            )
+
+    fake_client = SimpleNamespace(decisions=DynamicDecisions())
+    reserved = []
+    scorer = make_scorer(client=fake_client, chunk_size=2, reserve=reserved.append, deadline=lambda: 9e12)
+    scores = scorer(["nothing", "keep one", "keep two"], "what is relevant")
+    assert scores == [0.1, 0.9, 0.9]
+    assert reserved == [1, 1]
+    assert all(c["model"] == DEFAULT_GEMINI_MODEL for c in calls)
+    assert all("timeout" in c for c in calls)
+
+    gate = make_evidence_gate(scorer, min_chars=10)
+    text = "\n".join(["\n".join(["keep line"] * 40), "\n".join(["noise line"] * 40)])
+    gated = gate("what does keep do?", text)
+    assert "keep line" in gated
+    assert "noise line" not in gated

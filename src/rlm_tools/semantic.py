@@ -16,15 +16,18 @@ automatically rather than waiting to be chosen.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from typing import Any, Callable, Protocol
 
 from rlm_tools.llm_bridge import request_timeout
 
 DEFAULT_MODEL = "jev-latest"
+DEFAULT_GEMINI_MODEL = "gemini-decision-1"
 DEFAULT_CHUNK_SIZE = 12
 DEFAULT_MAX_WORKERS = 4
 DEFAULT_MAX_ITEM_CHARS = 600
@@ -34,6 +37,7 @@ DEFAULT_GATE_CHUNK_LINES = 40
 DEFAULT_GATE_MIN_CHARS = 2_000
 DEFAULT_GATE_MIN_SEPARATION = 0.2
 ELISION = "\n[... dropped as irrelevant to the question ...]\n"
+_VALID_GATE_PROVIDERS = frozenset({"typesafe", "gemini"})
 
 EXHAUSTIVE_QUESTION = re.compile(
     r"\b(every|all|each|list|enumerate|exhaustive|entire|complete)\b", re.IGNORECASE
@@ -44,7 +48,104 @@ class SystemOneClient(Protocol):
     def system_one(self, state: Any, questions: dict[str, Any], **kwargs: Any) -> Any: ...
 
 
-def get_client(api_key: str | None = None, model: str | None = None) -> SystemOneClient:
+def resolve_provider(provider: str | None = None) -> str:
+    """Resolve the relevance scoring provider ('typesafe' or 'gemini')."""
+    if provider is not None:
+        normalized = provider.strip().lower()
+        if normalized and normalized != "auto":
+            if normalized not in _VALID_GATE_PROVIDERS:
+                raise ValueError(
+                    f"Unsupported gate provider {provider!r}; expected 'typesafe', 'gemini', or 'auto'"
+                )
+            return normalized
+
+    env_provider = os.environ.get("RLM_GATE_PROVIDER", "auto").strip().lower()
+    if env_provider in {"", "auto"}:
+        if os.environ.get("TYPESAFE_API_KEY"):
+            return "typesafe"
+        if os.environ.get("GEMINI_API_KEY"):
+            return "gemini"
+        return "typesafe"
+    if env_provider not in _VALID_GATE_PROVIDERS:
+        raise ValueError(
+            f"Unsupported RLM_GATE_PROVIDER {env_provider!r}; expected 'typesafe', 'gemini', or 'auto'"
+        )
+    return env_provider
+
+
+def has_configured_scorer() -> bool:
+    """Return True when the configured (or auto-detected) gate provider has credentials."""
+    env_provider = os.environ.get("RLM_GATE_PROVIDER", "auto").strip().lower()
+    if env_provider in {"", "auto"}:
+        return bool(os.environ.get("TYPESAFE_API_KEY") or os.environ.get("GEMINI_API_KEY"))
+    if env_provider == "typesafe":
+        return bool(os.environ.get("TYPESAFE_API_KEY"))
+    if env_provider == "gemini":
+        return bool(os.environ.get("GEMINI_API_KEY"))
+    return False
+
+
+class _GeminiDecisionsAdapter:
+    """Adapt google-genai's v1beta Decisions API to the SystemOneClient protocol."""
+
+    def __init__(self, client: Any, model: str = DEFAULT_GEMINI_MODEL):
+        self._client = client
+        self._model = model
+
+    def system_one(self, state: Any, questions: dict[str, Any], **kwargs: Any) -> Any:
+        shared_input = state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
+        formatted_questions: dict[str, dict[str, Any]] = {}
+        for key, question in questions.items():
+            if isinstance(question, dict):
+                entry = dict(question)
+                entry.setdefault("type", "noul")
+                formatted_questions[key] = entry
+            else:
+                instructions = getattr(question, "instructions", None)
+                formatted_questions[key] = {
+                    "type": "noul",
+                    "instructions": instructions if instructions is not None else str(question),
+                }
+
+        create_kwargs: dict[str, Any] = {}
+        if "timeout" in kwargs:
+            create_kwargs["timeout"] = kwargs["timeout"]
+        response = self._client.decisions.create(
+            model=self._model,
+            input=shared_input,
+            questions=formatted_questions,
+            **create_kwargs,
+        )
+        return SimpleNamespace(nouls=getattr(response, "answers", None) or {})
+
+
+def get_client(
+    api_key: str | None = None,
+    model: str | None = None,
+    *,
+    provider: str | None = None,
+) -> SystemOneClient:
+    resolved = resolve_provider(provider)
+    if resolved == "gemini":
+        key = api_key or os.environ.get("GEMINI_API_KEY")
+        if not key:
+            raise RuntimeError(
+                "GEMINI_API_KEY environment variable is required for Gemini relevance scoring"
+            )
+        try:
+            from google import genai
+        except ImportError as exc:
+            raise RuntimeError(
+                "google-genai package is required for Gemini relevance scoring (requires Python 3.11+); "
+                "install with the 'gemini' extra (rlm-tools[gemini])"
+            ) from exc
+        raw_client = genai.Client(
+            api_key=key,
+            http_options={"api_version": "v1beta", "retry_options": {"attempts": 1}},
+        )
+        decision_model = model or os.environ.get("GEMINI_DECISION_MODEL") or DEFAULT_GEMINI_MODEL
+        return _GeminiDecisionsAdapter(raw_client, model=decision_model)
+
     from typesafe_sdk import RetryPolicy, TypeSafeClient
 
     key = api_key or os.environ.get("TYPESAFE_API_KEY")
@@ -55,7 +156,7 @@ def get_client(api_key: str | None = None, model: str | None = None) -> SystemOn
     return TypeSafeClient(
         api_key=key,
         retry=RetryPolicy(max_retries=0),
-        model=model or os.environ.get("TYPESAFE_DEFAULT_MODEL", DEFAULT_MODEL),
+        model=model or os.environ.get("TYPESAFE_DEFAULT_MODEL") or DEFAULT_MODEL,
     )
 
 
@@ -72,19 +173,31 @@ def _index_chunks(count: int, size: int) -> list[list[int]]:
 
 
 def make_scorer(
-    client: SystemOneClient | None = None,
+    client: Any = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     max_workers: int = DEFAULT_MAX_WORKERS,
     max_item_chars: int = DEFAULT_MAX_ITEM_CHARS,
     reserve: Callable[[int], None] | None = None,
     deadline: Callable[[], float | None] | None = None,
+    *,
+    model: str | None = None,
+    provider: str | None = None,
 ) -> Callable[[list[str], str], list[float]]:
     """Build the batched relevance scorer.
 
     ``reserve`` is called with the number of API requests the scorer is about to
     make, so the session can charge them against a budget before they run.
     """
-    _client = client or get_client()
+    if client is not None:
+        if hasattr(client, "decisions") and not hasattr(client, "system_one"):
+            decision_model = model or os.environ.get("GEMINI_DECISION_MODEL") or DEFAULT_GEMINI_MODEL
+            _client: SystemOneClient = _GeminiDecisionsAdapter(client, model=decision_model)
+        else:
+            _client = client
+    elif model is None and provider is None:
+        _client = get_client()
+    else:
+        _client = get_client(model=model, provider=provider)
 
     def score_all(items: list[str], question: str) -> list[float]:
         """Probability per item that ``question`` is true of it, in input order."""

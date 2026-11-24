@@ -66,14 +66,24 @@ def render_policy_block() -> str:
     return (
         f"{POLICY_START}\n"
         "## RLM Tools Policy\n\n"
-        "For codebase exploration, prefer `rlm-tools` over standard read/grep/glob tools.\n\n"
+        "Choose the exploration tool based on task shape:\n"
+        "- Use `rlm-tools` for broad searches, multi-file audits/aggregations, large files, "
+        "cross-file counting/filtering, and multi-step analysis.\n"
+        "- Use standard read/grep/glob directly for quick narrow lookups (1-5 known small "
+        "files or a single targeted grep).\n\n"
         "Workflow:\n"
-        "1. Start with `rlm_start(path, query)`.\n"
-        "2. Use `rlm_execute(session_id, code)` to batch search/read/analyze steps.\n"
-        "3. Print concise summaries rather than raw payloads.\n"
-        "4. End with `rlm_end(session_id)` when finished.\n\n"
+        "1. Start once per task with `rlm_start(path, query)` (or pass an initial exploration "
+        "`code=...` script).\n"
+        "2. Batch multiple search/read/analyze steps into `rlm_execute(session_id, code)`, "
+        "building on persistent variables, and pass `end_session=true` on your final "
+        "`rlm_execute` (or finish with `rlm_end(session_id)`).\n"
+        "3. Follow sandbox rules: use built-in helpers (`read_file`, `read_files`, `grep`, "
+        "`grep_summary`, `grep_read`, `glob_files`, `tree`) and f-strings — do not import "
+        "`os`, `glob`, `pathlib`, or `ast`, and do not call `open()`, `exec()`, `eval()`, "
+        "`getattr()`, `dir()`, `type()`, or `.format()`.\n"
+        "4. Aggregate in Python variables and print concise summaries rather than raw file dumps.\n\n"
         "Fallback rule:\n"
-        "- Use standard read/grep/glob only if `rlm-tools` is unavailable or errors.\n"
+        "- Fall back to standard read/grep/glob if `rlm-tools` is unavailable or errors.\n"
         f"{POLICY_END}\n"
     )
 
@@ -149,8 +159,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="rlm-tools-setup",
         description=(
-            "Configure rlm-tools for Claude/Codex and optionally write policy guidance "
-            "that makes agents prefer rlm-tools for code exploration."
+            "Configure rlm-tools for Claude/Codex and optionally write workload-aware policy "
+            "guidance for code exploration."
         ),
     )
     parser.add_argument(

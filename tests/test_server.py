@@ -443,3 +443,103 @@ def test_the_gate_can_be_switched_off(tmp_path, monkeypatch):
     monkeypatch.setenv("RLM_RECURSE_GATE", "0")
 
     assert server_module._make_recurse_gate(session=None) is None
+
+
+def test_start_includes_allowed_imports_and_supports_code_and_end_session(tmp_path):
+    (tmp_path / "data.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+    # Initial code on rlm_start keeps the session open and returns stdout/allowed_imports.
+    started_with_error = json.loads(_rlm_start(
+        path=str(tmp_path),
+        query="bad import",
+        code="import os\nprint(1)",
+    ))
+    sid_err = started_with_error["session_id"]
+    try:
+        assert "not allowed" in started_with_error["error"]
+        assert "json" in started_with_error["allowed_imports"]
+        assert "os" not in started_with_error["allowed_imports"]
+
+        recovered = json.loads(_rlm_execute(
+            sid_err,
+            "print(read_file('data.txt').splitlines()[0])",
+            end_session=True,
+        ))
+        assert recovered["error"] is None
+        assert recovered["stdout"] == "alpha\n"
+        assert recovered["session_ended"] is True
+        assert "not found or expired" in json.loads(_rlm_execute(sid_err, "print(1)"))["error"]
+    finally:
+        _rlm_end(sid_err)
+
+    # Start with initial code preserves variables across rlm_execute and supports finalize + end_session=True.
+    multi = json.loads(_rlm_start(
+        path=str(tmp_path),
+        query="keep state",
+        code="items = read_file('data.txt').splitlines()\nprint('loaded')\nrlm_finalize(len(items))",
+    ))
+    sid = multi["session_id"]
+    try:
+        assert multi["error"] is None
+        assert multi["stdout"] == "loaded\n"
+        assert multi["final"] == {"final": 3}
+        assert "re" in multi["allowed_imports"]
+        assert "session_ended" not in multi
+
+        mid = json.loads(_rlm_execute(sid, "print(items[1])"))
+        assert mid == {"stdout": "beta\n", "error": None}
+        assert "session_ended" not in mid
+
+        err_end = json.loads(_rlm_execute(sid, "open('data.txt')", end_session=True))
+        assert err_end["session_ended"] is False
+        assert err_end["error"] is not None
+
+        done = json.loads(_rlm_execute(sid, "print(items[2])", end_session=True))
+        assert done == {"stdout": "gamma\n", "error": None, "session_ended": True}
+        assert "not found" in json.loads(_rlm_execute(sid, "print(1)"))["error"]
+    finally:
+        _rlm_end(sid)
+
+
+def test_gemini_external_session_installs_llm_tools_and_gate(external_test_roots, tmp_path, monkeypatch):
+    import rlm_tools.server as server_module
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("RLM_RECURSE_GATE", "1")
+    with patch.object(server_module, "make_scorer", return_value=lambda items, q: [0.9] * len(items)) as make_scorer_mock, \
+            patch.object(server_module, "make_llm_query", return_value=lambda prompt, context="": f"gemini:{prompt}") as make_query_mock, \
+            patch.object(server_module, "make_recursive_query", return_value=lambda prompt, context="": f"rec:{prompt}") as make_rec_mock:
+        started = json.loads(server_module._rlm_start(str(tmp_path), "gemini external"))
+        sid = started["session_id"]
+        try:
+            assert "llm_query(prompt, context='')" in started["available_functions"]
+            assert "rlm_recurse(prompt, context='')" in started["available_functions"]
+            make_scorer_mock.assert_called_once()
+            make_query_mock.assert_called_once()
+            assert make_rec_mock.call_args.kwargs["gate"] is not None
+        finally:
+            server_module._rlm_end(sid)
+
+
+@pytest.mark.parametrize(
+    ("env_key", "env_val"),
+    [
+        ("OPENAI_API_KEY", "test-openai-key"),
+        ("OPENAI_BASE_URL", "http://localhost:11434/v1"),
+    ],
+)
+def test_openai_compat_external_session_installs_llm_tools(external_test_roots, tmp_path, monkeypatch, env_key, env_val):
+    import rlm_tools.server as server_module
+
+    monkeypatch.setenv(env_key, env_val)
+    with patch.object(server_module, "make_llm_query", return_value=lambda prompt, context="": f"oa:{prompt}") as make_query_mock, \
+            patch.object(server_module, "make_recursive_query", return_value=lambda prompt, context="": f"rec:{prompt}") as make_rec_mock:
+        started = json.loads(server_module._rlm_start(str(tmp_path), "openai compat external"))
+        sid = started["session_id"]
+        try:
+            assert "llm_query(prompt, context='')" in started["available_functions"]
+            assert "rlm_recurse(prompt, context='')" in started["available_functions"]
+            make_query_mock.assert_called_once()
+            make_rec_mock.assert_called_once()
+        finally:
+            server_module._rlm_end(sid)

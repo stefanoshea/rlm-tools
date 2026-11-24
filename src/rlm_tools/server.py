@@ -14,11 +14,13 @@ from rlm_tools.helpers import scan_metadata as _scan_metadata
 from rlm_tools.session import Session, SessionManager
 from rlm_tools.sandbox import Sandbox
 from rlm_tools.llm_bridge import (
+    has_configured_provider,
     make_llm_query,
     make_llm_query_batched,
     make_recursive_query,
 )
-from rlm_tools.semantic import make_evidence_gate, make_scorer
+from rlm_tools.semantic import has_configured_scorer, make_evidence_gate, make_scorer
+from rlm_tools.worker_runtime import ALLOWED_MODULES
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,6 +34,15 @@ session_manager = SessionManager(
 
 _sandboxes: dict[str, Sandbox] = {}
 _mcp_session_locks: WeakValueDictionary[str, Lock] = WeakValueDictionary()
+
+
+def _close_session(session_id: str) -> None:
+    sandbox = _sandboxes.pop(session_id, None)
+    try:
+        if sandbox:
+            sandbox.close()
+    finally:
+        session_manager.end(session_id)
 
 
 def _cleanup_expired_resources() -> None:
@@ -61,8 +72,8 @@ def _make_call_reserver(session):
 
 
 def _make_recurse_gate(session, reserve=None, deadline=None):
-    """Build the optional TypeSafe scoring gate for an external-enabled session."""
-    if not os.environ.get("TYPESAFE_API_KEY") or os.environ.get("RLM_RECURSE_GATE") != "1":
+    """Build the optional relevance scoring gate for an external-enabled session."""
+    if os.environ.get("RLM_RECURSE_GATE") != "1" or not has_configured_scorer():
         return None
 
     try:
@@ -74,8 +85,7 @@ def _make_recurse_gate(session, reserve=None, deadline=None):
 
 
 def _install_session_llm_tools(session, sandbox: Sandbox) -> bool:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
+    if not has_configured_provider():
         return False
 
     try:
@@ -122,8 +132,10 @@ def _rlm_start(
     include_guidance: bool = False,
     include_metadata: bool = False,
     max_memory_bytes: int = 10_000_000,
+    code: str = "",
 ) -> str:
     _cleanup_expired_resources()
+    has_code = bool(code and code.strip())
 
     try:
         policy = workspace_policy()
@@ -152,6 +164,7 @@ def _rlm_start(
         return _initialize_session(
             session, execution_timeout_seconds, include_guidance, include_metadata,
             allow_external=policy.allows_external(root),
+            code=code if has_code else "",
         )
     finally:
         session_manager.release(session)
@@ -164,6 +177,7 @@ def _initialize_session(
     include_metadata: bool,
     *,
     allow_external: bool,
+    code: str = "",
 ) -> str:
     session_id = session.session_id
     resolved = session.path
@@ -220,6 +234,7 @@ def _initialize_session(
             "execution_timeout_seconds": execution_timeout_seconds,
         },
         "available_functions": available_functions,
+        "allowed_imports": sorted(ALLOWED_MODULES),
     }
     if include_guidance:
         response["strategy"] = (
@@ -229,9 +244,11 @@ def _initialize_session(
             "Aim for ~5-15 rlm_execute calls total, not 50+. "
             "A wide case-insensitive grep_summary beats several narrow greps: it costs one call and "
             "shows you which files matter before you read any of them. "
+            "Do not import os/glob/pathlib/ast or call open()/exec()/eval()/getattr()/str.format() — use the built-in helpers and f-strings. "
             "Use llm_query() for semantic analysis on extracted snippets. "
             "Use llm_query_batched() when analyzing multiple snippets concurrently. "
-            "Variables persist between calls — build on previous results."
+            "Variables persist between calls — build on previous results. "
+            "Pass end_session=True on your final rlm_execute call to close without an extra rlm_end call."
         )
         response["example"] = (
             "# Good: orient, cast a wide net, then read only the survivors\n"
@@ -241,6 +258,14 @@ def _initialize_session(
             "    print('=' * 20, path)\n"
             "    print(read_file(path)[:2000])\n"
         )
+
+    if code:
+        exec_response = _execute_session_data(session, code, "compact", 20)
+        response["stdout"] = exec_response.get("stdout", "")
+        response["error"] = exec_response.get("error")
+        if "final" in exec_response:
+            response["final"] = exec_response["final"]
+
     return json.dumps(response)
 
 
@@ -249,32 +274,33 @@ def _rlm_execute(
     code: str,
     detail_level: Literal["compact", "usage", "full"] = "compact",
     max_new_variables: int = 20,
+    end_session: bool = False,
 ) -> str:
     _cleanup_expired_resources()
     with session_manager.use(session_id) as session:
         if not session:
             return json.dumps({"error": f"Session '{session_id}' not found or expired"})
-        return _execute_session(session, code, detail_level, max_new_variables)
+        return _execute_session(session, code, detail_level, max_new_variables, end_session)
 
 
-def _execute_session(
+def _execute_session_data(
     session: Session,
     code: str,
     detail_level: Literal["compact", "usage", "full"],
     max_new_variables: int,
-) -> str:
+) -> dict:
     session_id = session.session_id
     sandbox = _sandboxes.get(session_id)
     if not sandbox:
-        return json.dumps({"error": f"Sandbox not found for session '{session_id}'"})
+        return {"error": f"Sandbox not found for session '{session_id}'"}
 
     if session.execute_calls >= session.max_execute_calls:
-        return json.dumps({
+        return {
             "error": (
                 "Execution call limit exceeded: "
                 f"{session.execute_calls} >= {session.max_execute_calls}"
             )
-        })
+        }
 
     session.execute_calls += 1
     result = sandbox.execute(code)
@@ -318,6 +344,23 @@ def _execute_session(
         if len(new_vars) > max_new_variables:
             response["new_variables_truncated_count"] = len(new_vars) - max_new_variables
 
+    return response
+
+
+def _execute_session(
+    session: Session,
+    code: str,
+    detail_level: Literal["compact", "usage", "full"],
+    max_new_variables: int,
+    end_session: bool = False,
+) -> str:
+    response = _execute_session_data(session, code, detail_level, max_new_variables)
+    if end_session and "error" in response:
+        if response["error"] is None:
+            _close_session(session.session_id)
+            response["session_ended"] = True
+        else:
+            response["session_ended"] = False
     return json.dumps(response)
 
 
@@ -325,12 +368,7 @@ def _rlm_end(session_id: str) -> str:
     _cleanup_expired_resources()
     with session_manager.use(session_id) as session:
         if session is not None:
-            sandbox = _sandboxes.pop(session_id, None)
-            try:
-                if sandbox:
-                    sandbox.close()
-            finally:
-                session_manager.end(session_id)
+            _close_session(session_id)
     return json.dumps({"success": True})
 
 
@@ -357,11 +395,16 @@ async def rlm_start(
     include_guidance: Annotated[bool, Field(description="Include strategy/example guidance text in the response (larger payload)")] = False,
     include_metadata: Annotated[bool, Field(description="Scan directory and include file counts/types in response (set false for faster startup)")] = False,
     max_memory_bytes: Annotated[int, Field(description="Maximum in-memory bytes retained for this session", ge=1024, le=100_000_000)] = 10_000_000,
+    code: Annotated[str, Field(description=(
+        "Optional initial Python script (e.g., tree/glob_files/grep_summary) to run right after opening the session; "
+        "same helpers and restrictions as rlm_execute."
+    ))] = "",
 ) -> str:
-    """Start an RLM exploration session. Returns session_id, metadata, limits, and available functions. Set include_guidance=true to include strategy/example coaching text."""
+    """Start a persistent RLM exploration session once per task (returns session_id, limits, available_functions, allowed_imports). Optionally pass initial code to explore immediately, then use rlm_execute(session_id, ...) for follow-up steps and pass end_session=true on your final rlm_execute call (do not call rlm_start repeatedly)."""
     return await to_thread.run_sync(
         _rlm_start, path, query, max_output_chars, max_llm_calls, max_execute_calls,
         execution_timeout_seconds, include_guidance, include_metadata, max_memory_bytes,
+        code,
     )
 
 
@@ -369,9 +412,15 @@ async def rlm_start(
 async def rlm_execute(
     session_id: Annotated[str, Field(description="Session ID from rlm_start")],
     code: Annotated[str, Field(description=(
-        "Python code to execute. IMPORTANT: Batch multiple related operations into each call. "
-        "A good call does: grep -> read top matches -> extract patterns -> print summary. "
-        "A bad call does just one grep or one read_file. Variables persist between calls."
+        "Python code to execute in the persistent sandbox (variables persist across calls). "
+        "Built-in helpers: read_file(path), read_files(paths), grep(pattern, path='.'), "
+        "grep_summary(pattern, path='.'), grep_read(pattern, path='.', max_files=10, context_lines=0), "
+        "glob_files(pattern), tree(path='.', max_depth=3), rlm_finalize(value). "
+        "Allowed imports ONLY: re, json, collections, math, fnmatch, itertools, functools, "
+        "operator, string, textwrap, difflib, statistics. "
+        "Blocked (never use): os, glob, pathlib, ast, open(), exec(), eval(), getattr(), dir(), type(), "
+        "str.format()/format_map() (use f-strings) — use glob_files/read_file/tree/re instead. "
+        "Batch multiple operations per call and print only concise summaries rather than raw dumps."
     ))],
     detail_level: Annotated[Literal["compact", "usage", "full"], Field(
         description="Response payload level: compact=stdout+error, usage=add usage metrics, full=add variable details"
@@ -381,16 +430,19 @@ async def rlm_execute(
         ge=1,
         le=200,
     )] = 20,
+    end_session: Annotated[bool, Field(
+        description="If true, close the session immediately after code succeeds (avoids a separate rlm_end turn). Stays open on error."
+    )] = False,
 ) -> str:
-    """Execute Python in the session sandbox. detail_level controls response payload size (compact, usage, or full)."""
-    return await _run_session_operation(_rlm_execute, session_id, code, detail_level, max_new_variables)
+    """Execute Python in the session sandbox and return printed stdout. Set end_session=true on your final step to close the session without a separate rlm_end call."""
+    return await _run_session_operation(_rlm_execute, session_id, code, detail_level, max_new_variables, end_session)
 
 
 @mcp.tool()
 async def rlm_end(
     session_id: Annotated[str, Field(description="Session ID to end")],
 ) -> str:
-    """End an RLM exploration session and free resources."""
+    """End an RLM exploration session and free resources. Prefer passing end_session=true on your final rlm_execute call to save a turn."""
     return await _run_session_operation(_rlm_end, session_id)
 
 
