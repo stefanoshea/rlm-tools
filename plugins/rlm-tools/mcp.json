@@ -4,7 +4,7 @@
     "rlm-tools": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["rlm-tools==0.2.3"]
+      "args": ["rlm-tools==0.2.4"]
     }
   }
 }

@@ -7,7 +7,7 @@
     {
       "name": "rlm-tools",
       "description": "Confined Python sandbox and recursive exploration tools for token-efficient codebase analysis",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "category": "Developer Tools",
       "source": {
         "source": "local",
