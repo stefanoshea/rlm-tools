@@ -491,6 +491,167 @@ def test_server_integration_exposes_helpers_only_for_external_roots(tmp_path, mo
         assert exec_out["error"] is None
         assert exec_out["stdout"].strip() == "hello"
         assert exec_out["session_ended"] is True
+        assert "usage" in exec_out
     except BaseException:
         _rlm_end(sid)
         raise
+
+
+def test_recurse_ignores_answer_when_action_is_request_and_recovers_empty_requests(monkeypatch):
+    monkeypatch.setenv("RLM_SUB_PROVIDER", "claude-cli")
+    replies = [
+        {
+            "type": "result",
+            "is_error": False,
+            "result": "{}",
+            "structured_output": {
+                "action": "request",
+                "answer": "Not yet verified ... lookups pending",
+                "requests": [],
+            },
+        },
+        {
+            "type": "result",
+            "is_error": False,
+            "result": "{}",
+            "structured_output": {
+                "action": "request",
+                "answer": "Not yet verified ... lookups pending",
+                "requests": [{"op": "read_file", "args": {"path": "a.py"}}],
+            },
+        },
+        {
+            "type": "result",
+            "is_error": False,
+            "result": "{}",
+            "structured_output": {
+                "action": "final",
+                "answer": "Verified answer from a.py",
+            },
+        },
+    ]
+    prompts = []
+
+    def fake_run(cmd, **kw):
+        prompts.append(kw["input"])
+        return _proc(stdout=json.dumps(replies.pop(0)))
+
+    monkeypatch.setattr(llm_bridge.subprocess, "run", fake_run)
+    rq = make_recursive_query(helpers={"read_file": lambda path: "def ok(): pass"}, max_iterations=4)
+    ans = rq("check a.py")
+    assert ans == "Verified answer from a.py"
+    assert len(prompts) == 3
+
+
+def test_claude_cli_usage_and_cost_reported_in_execute_usage(tmp_path, monkeypatch):
+    monkeypatch.setenv("RLM_SUB_PROVIDER", "claude-cli")
+    monkeypatch.setenv("RLM_EXTERNAL_ROOTS", str(tmp_path))
+    workspace_policy.cache_clear()
+    (tmp_path / "sample.py").write_text("x = 1\n")
+
+    cli_reply = json.dumps({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "cli answer",
+        "usage": {
+            "input_tokens": 120,
+            "output_tokens": 35,
+            "cache_read_input_tokens": 500,
+        },
+        "total_cost_usd": 0.0042,
+    })
+    monkeypatch.setattr(llm_bridge.subprocess, "run", lambda cmd, **kw: _proc(stdout=cli_reply))
+
+    started = json.loads(_rlm_start(str(tmp_path), "usage check"))
+    sid = started["session_id"]
+    try:
+        out = json.loads(_rlm_execute(sid, "print(llm_query('hi'))", end_session=True))
+        assert out["error"] is None
+        assert out["session_ended"] is True
+        sub_usage = out["usage"]["sub_llm_usage"]
+        assert sub_usage["input_tokens"] == 120
+        assert sub_usage["output_tokens"] == 35
+        assert sub_usage["cache_read_input_tokens"] == 500
+        assert sub_usage["total_cost_usd"] == pytest.approx(0.0042)
+    except BaseException:
+        _rlm_end(sid)
+        raise
+
+
+def test_cli_env_strips_provider_and_claude_code_vars_but_keeps_config_dir(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_BEDROCK_BASE_URL", "https://bedrock.example")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "secret-oauth")
+    monkeypatch.setenv("GEMINI_API_KEY", "secret-gemini")
+    monkeypatch.setenv("OPENAI_API_KEY", "secret-openai")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://openai.local")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "secret-ts")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/tmp/claude-cfg")
+
+    env = llm_bridge._cli_env()
+    for stripped in (
+        "ANTHROPIC_BEDROCK_BASE_URL",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "GEMINI_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "TYPESAFE_API_KEY",
+    ):
+        assert stripped not in env
+    assert env["CLAUDE_CONFIG_DIR"] == "/tmp/claude-cfg"
+
+
+def test_recurse_turn0_empty_final_answer_synthesizes(monkeypatch):
+    monkeypatch.setenv("RLM_SUB_PROVIDER", "claude-cli")
+    replies = [
+        {
+            "type": "result",
+            "is_error": False,
+            "result": "{}",
+            "structured_output": {"action": "final", "answer": ""},
+        },
+        {
+            "type": "result",
+            "is_error": False,
+            "result": "Synthesized from context",
+        },
+    ]
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+        return _proc(stdout=json.dumps(replies.pop(0)))
+
+    monkeypatch.setattr(llm_bridge.subprocess, "run", fake_run)
+    rq = make_recursive_query(helpers={}, max_iterations=3)
+    assert rq("summarize", context="alpha=1") == "Synthesized from context"
+    assert len(cmds) == 2
+    assert "--json-schema" not in cmds[1]
+
+
+def test_recurse_penultimate_empty_requests_synthesizes_without_conflicting_instruction(monkeypatch):
+    monkeypatch.setenv("RLM_SUB_PROVIDER", "claude-cli")
+    replies = [
+        {
+            "type": "result",
+            "is_error": False,
+            "result": "{}",
+            "structured_output": {"action": "request", "requests": []},
+        },
+        {
+            "type": "result",
+            "is_error": False,
+            "result": "Final synthesized answer",
+        },
+    ]
+    prompts = []
+
+    def fake_run(cmd, **kw):
+        prompts.append(kw["input"])
+        return _proc(stdout=json.dumps(replies.pop(0)))
+
+    monkeypatch.setattr(llm_bridge.subprocess, "run", fake_run)
+    rq = make_recursive_query(helpers={}, max_iterations=2)
+    assert rq("question") == "Final synthesized answer"
+    assert len(prompts) == 2
+    assert "Either provide 1-4" not in prompts[1]

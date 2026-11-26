@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from rlm_tools.helpers import make_helpers
+from rlm_tools.session import default_max_memory_bytes
 from rlm_tools.worker_protocol import (
     WorkerChannel,
     WorkerProtocolError,
@@ -16,7 +17,7 @@ from rlm_tools.worker_protocol import (
 
 
 _WORKER_RESPONSE_GRACE_SECONDS = 1
-_WORKER_STARTUP_TIMEOUT_SECONDS = 10
+_WORKER_STARTUP_TIMEOUT_SECONDS = 20
 
 
 @dataclass
@@ -34,7 +35,7 @@ class Sandbox:
         base_path: str,
         max_output_chars: int = 15_000,
         execution_timeout_seconds: int = 30,
-        max_memory_bytes: int = 10_000_000,
+        max_memory_bytes: int | None = None,
         max_address_space_bytes: int | None = None,
         cpu_seconds: int = 600,
         *,
@@ -45,13 +46,15 @@ class Sandbox:
         if execution_timeout_seconds <= 0:
             raise ValueError("Sandbox execution_timeout_seconds must be positive")
         self._execution_timeout_seconds = execution_timeout_seconds
-        self._max_memory_bytes = max_memory_bytes
+        self._max_memory_bytes = (
+            default_max_memory_bytes() if max_memory_bytes is None else max_memory_bytes
+        )
         # OS-level backstop ceiling for the worker's virtual address space, well
         # above the precise per-session byte cap. Stops a single runaway
         # allocation from OOMing the host before the post-exec accounting runs.
         # No-op where the platform ignores RLIMIT_AS (e.g. macOS).
         if max_address_space_bytes is None:
-            max_address_space_bytes = max(1_073_741_824, max_memory_bytes * 8 + 536_870_912)
+            max_address_space_bytes = max(1_073_741_824, self._max_memory_bytes * 8 + 536_870_912)
         self._max_address_space_bytes = max_address_space_bytes
         self._cpu_seconds = cpu_seconds
         self._helper_memory_bytes_used = 0
@@ -219,6 +222,11 @@ class Sandbox:
             self._last_variables = message["variables"]
             self._worker_memory_bytes_used = message.get("memory_bytes_used", 0)
             memory_bytes_used = self.memory_bytes_used
+            if memory_bytes_used > self._max_memory_bytes and self._helper_memory_bytes_used > 0:
+                evict = getattr(self._workspace, "_evict_file_cache", None)
+                if evict is not None:
+                    evict(memory_bytes_used - self._max_memory_bytes)
+                    memory_bytes_used = self.memory_bytes_used
             if memory_bytes_used > self._max_memory_bytes:
                 self._worker_unavailable_error = (
                     "RuntimeError: Sandbox worker was closed after exceeding the session memory limit"

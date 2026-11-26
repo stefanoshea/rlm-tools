@@ -131,6 +131,7 @@ The sandbox provides built-in helpers:
 - `grep(pattern)` / `grep_summary(pattern)` / `grep_read(pattern)` — Search
 - `glob_files(pattern)` — Find files by pattern
 - `tree(path, max_depth)` — Directory structure
+- `enclosing(path, line)` / `find_assignments(path, target)` — Python AST scope and assignment lookup
 - `llm_query(prompt, context)` / `llm_query_batched(prompts, context)` — Sub-LLM analysis (optional, requires a provider key, `OPENAI_BASE_URL`, or `RLM_SUB_PROVIDER=claude-cli`)
 - `rlm_recurse(prompt, context)` / `rlm_recurse_batched(prompts, context)` — Ask a sub-agent to explore the session directory (optional, requires a provider key, `OPENAI_BASE_URL`, or `RLM_SUB_PROVIDER=claude-cli`)
 
@@ -276,8 +277,14 @@ A grant covers the named directory and its descendants. Keep private repositorie
 | `RLM_SUB_TIMEOUT_SECONDS` | `60` | Per-request timeout for sub-LLM calls |
 | `RLM_SUB_MAX_RETRIES` | `3` | Retry attempts for transient sub-LLM failures |
 | `RLM_RECURSE_MAX_DEPTH` | `2` | Max recursion depth for `rlm_recurse()` child agents |
-| `RLM_MAX_SESSIONS` | `5` | Max concurrent sessions |
+| `RLM_MAX_SESSIONS` | `16` | Max concurrent sessions (idle sessions over `RLM_IDLE_EVICT_SECONDS` are LRU-evicted at the cap) |
 | `RLM_SESSION_TIMEOUT` | `10` | Session timeout in minutes |
+| `RLM_IDLE_EVICT_SECONDS` | `60` | Minimum idle seconds before an inactive session can be evicted at `RLM_MAX_SESSIONS` |
+| `RLM_MAX_MEMORY_BYTES` | `67108864` (64 MiB) | Default per-session retained memory cap in bytes |
+| `RLM_EXECUTION_TIMEOUT_SECONDS` | `30` (`60` external API, `180` `claude-cli`) | Default per-`rlm_execute` timeout in seconds when not passed to `rlm_start` |
+| `RLM_MAX_SCAN_BYTES` | `268435456` (256 MiB) | Max bytes read per workspace scan (`grep*` / `scan_metadata`) |
+| `RLM_MAX_SCAN_ENTRIES` | `100000` | Max directory entries visited per workspace scan |
+| `RLM_MAX_SCAN_SECONDS` | `15.0` | Max wall-clock seconds per workspace scan |
 
 ### Claude Code subscription (`claude-cli`)
 

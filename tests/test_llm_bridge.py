@@ -335,3 +335,57 @@ def test_get_client_anthropic_requires_key_and_constructs_client(monkeypatch):
     client = llm_bridge.get_client("anthropic")
     assert hasattr(client, "messages")
     assert constructed == {"api_key": "sk-ant-test", "max_retries": 0}
+
+
+def test_extract_response_usage_filters_non_finite_and_maps_gemini_fields():
+    bad = SimpleNamespace(
+        usage={"input_tokens": float("nan"), "output_tokens": float("inf"), "total_cost_usd": -1.0},
+        total_cost_usd=float("inf"),
+    )
+    assert llm_bridge._extract_response_usage(bad) is None
+
+    gemini_resp = SimpleNamespace(
+        usage=SimpleNamespace(
+            total_input_tokens=100,
+            total_output_tokens=25,
+            total_cached_tokens=40,
+            total_thought_tokens=15,
+        )
+    )
+    assert llm_bridge._extract_response_usage(gemini_resp) == {
+        "input_tokens": 100,
+        "output_tokens": 25,
+        "cache_read_input_tokens": 40,
+        "thought_tokens": 15,
+    }
+
+
+def test_on_usage_accumulates_across_multiturn_recurse():
+    turns = [
+        SimpleNamespace(
+            stop_reason="tool_use",
+            content=[SimpleNamespace(type="tool_use", id="t1", name="read_file", input={"path": "a.py"})],
+            usage=SimpleNamespace(input_tokens=50, output_tokens=10),
+        ),
+        SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text="done")],
+            usage=SimpleNamespace(input_tokens=70, output_tokens=20, cache_read_input_tokens=30),
+        ),
+    ]
+    client = SimpleNamespace(
+        messages=SimpleNamespace(create=lambda **kw: turns.pop(0)),
+    )
+    totals: dict[str, int | float] = {}
+
+    def on_usage(delta: dict[str, int | float]) -> None:
+        for k, v in delta.items():
+            totals[k] = totals.get(k, 0) + v
+
+    rq = llm_bridge.make_recursive_query(
+        client=client,
+        helpers={"read_file": lambda path: "x = 1"},
+        on_usage=on_usage,
+    )
+    assert rq("inspect a.py") == "done"
+    assert totals == {"input_tokens": 120, "output_tokens": 30, "cache_read_input_tokens": 30}

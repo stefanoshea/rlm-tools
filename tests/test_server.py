@@ -302,7 +302,10 @@ def test_new_defaults():
         data = json.loads(result)
         assert data["limits"]["max_execute_calls"] == 50
         assert data["limits"]["execution_timeout_seconds"] == 30
-        assert data["limits"]["max_memory_bytes"] == 10_000_000
+        assert data["limits"]["max_memory_bytes"] == 64 * 1024 * 1024
+        assert data["limits"]["max_scan_bytes"] == 256 * 1024 * 1024
+        assert data["limits"]["max_scan_entries"] == 100_000
+        assert data["limits"]["max_scan_seconds"] == 15.0
 
         _rlm_end(data["session_id"])
 
@@ -350,7 +353,7 @@ def test_usage_includes_memory_bytes():
         _rlm_end(session_id)
 
 
-def test_memory_limit_counts_worker_namespace_allocations():
+def test_memory_limit_evicts_largest_variable_and_keeps_session_alive():
     with tempfile.TemporaryDirectory() as tmpdir:
         start = json.loads(
             _rlm_start(
@@ -361,6 +364,7 @@ def test_memory_limit_counts_worker_namespace_allocations():
         )
         session_id = start["session_id"]
         try:
+            _rlm_execute(session_id, "keep = 'ok'")
             result = json.loads(
                 _rlm_execute(
                     session_id=session_id,
@@ -370,7 +374,12 @@ def test_memory_limit_counts_worker_namespace_allocations():
             )
             assert result["error"] is not None
             assert "memory" in result["error"].lower()
-            assert result["usage"]["memory_bytes_used"] > 1024
+            assert "dropped blob" in result["error"]
+            assert result["usage"]["memory_bytes_used"] <= 1024
+
+            follow_up = json.loads(_rlm_execute(session_id, "print(keep)"))
+            assert follow_up["error"] is None
+            assert follow_up["stdout"] == "ok\n"
         finally:
             _rlm_end(session_id)
 
@@ -524,7 +533,10 @@ def test_start_includes_allowed_imports_and_supports_code_and_end_session(tmp_pa
         assert err_end["error"] is not None
 
         done = json.loads(_rlm_execute(sid, "print(items[2])", end_session=True))
-        assert done == {"stdout": "gamma\n", "error": None, "session_ended": True}
+        assert done["stdout"] == "gamma\n"
+        assert done["error"] is None
+        assert done["session_ended"] is True
+        assert done["usage"]["execute_calls_used"] == 4
         assert "not found" in json.loads(_rlm_execute(sid, "print(1)"))["error"]
     finally:
         _rlm_end(sid)
@@ -572,3 +584,130 @@ def test_openai_compat_external_session_installs_llm_tools(external_test_roots, 
             make_rec_mock.assert_called_once()
         finally:
             server_module._rlm_end(sid)
+
+
+def test_ast_helpers_and_return_shapes_exposed_in_server(tmp_path):
+    (tmp_path / "mod.py").write_text(
+        "class Widget:\n"
+        "    def build(self):\n"
+        "        self.items: list[str] = []\n"
+        "        return self.items\n"
+    )
+    started = json.loads(_rlm_start(str(tmp_path), "ast helpers"))
+    sid = started["session_id"]
+    try:
+        funcs = " ".join(started["available_functions"])
+        assert "enclosing(path, line)" in funcs
+        assert "find_assignments(path, target)" in funcs
+
+        res = json.loads(_rlm_execute(
+            sid,
+            "import json\n"
+            "e = enclosing('mod.py', 4)\n"
+            "a = find_assignments('mod.py', 'self.items')\n"
+            "print(json.dumps({'q': e['qualified'], 'a': a[0]['kind']}))",
+            detail_level="full",
+        ))
+        assert res["error"] is None
+        assert json.loads(res["stdout"]) == {"q": "Widget.build", "a": "ann_assign"}
+        assert "enclosing" not in res["variables"]
+        assert "find_assignments" not in res["variables"]
+    finally:
+        _rlm_end(sid)
+
+
+def test_lru_eviction_closes_evicted_sandbox_immediately(tmp_path, monkeypatch):
+    from rlm_tools import server
+    from rlm_tools.session import SessionManager
+
+    mgr = SessionManager(max_sessions=2, timeout_minutes=10, idle_evict_seconds=60.0)
+    monkeypatch.setattr(server, "session_manager", mgr)
+    monkeypatch.setattr(server, "_sandboxes", {})
+
+    s1 = json.loads(server._rlm_start(str(tmp_path), "one"))["session_id"]
+    s2 = json.loads(server._rlm_start(str(tmp_path), "two"))["session_id"]
+    worker1 = server._sandboxes[s1]._process
+    mgr.get(s1).last_used -= 120
+
+    s3 = json.loads(server._rlm_start(str(tmp_path), "three"))["session_id"]
+    try:
+        assert s1 not in server._sandboxes
+        assert worker1.poll() is not None
+        assert s2 in server._sandboxes
+        assert s3 in server._sandboxes
+    finally:
+        server._rlm_end(s2)
+        server._rlm_end(s3)
+
+
+def test_dynamic_execution_timeout_defaults(external_test_roots, tmp_path, monkeypatch):
+    import rlm_tools.server as server_module
+    import rlm_tools.llm_bridge as llm_bridge
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.delenv("RLM_EXECUTION_TIMEOUT_SECONDS", raising=False)
+    api_start = json.loads(server_module._rlm_start(str(tmp_path), "api timeout"))
+    try:
+        assert api_start["limits"]["execution_timeout_seconds"] == 60
+    finally:
+        server_module._rlm_end(api_start["session_id"])
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("RLM_SUB_PROVIDER", "claude-cli")
+    monkeypatch.setattr(llm_bridge.shutil, "which", lambda name: "/usr/bin/claude")
+    cli_start = json.loads(server_module._rlm_start(str(tmp_path), "cli timeout"))
+    try:
+        assert cli_start["limits"]["execution_timeout_seconds"] == 180
+    finally:
+        server_module._rlm_end(cli_start["session_id"])
+
+
+def test_cleanup_expired_resources_isolates_close_errors_and_unpins_new_session(tmp_path, monkeypatch):
+    from rlm_tools import server
+    from rlm_tools.session import SessionManager
+
+    mgr = SessionManager(max_sessions=2, timeout_minutes=10, idle_evict_seconds=60.0)
+    monkeypatch.setattr(server, "session_manager", mgr)
+    monkeypatch.setattr(server, "_sandboxes", {})
+
+    s1 = json.loads(server._rlm_start(str(tmp_path), "one"))["session_id"]
+    s2 = json.loads(server._rlm_start(str(tmp_path), "two"))["session_id"]
+    mgr.get(s1).last_used -= 120
+
+    # Make s1's sandbox.close() raise; s3 must still start cleanly and not stay pinned.
+    real_close = server._sandboxes[s1].close
+
+    def flaky_close():
+        real_close()
+        raise RuntimeError("boom on close")
+
+    monkeypatch.setattr(server._sandboxes[s1], "close", flaky_close)
+
+    s3 = json.loads(server._rlm_start(str(tmp_path), "three"))["session_id"]
+    try:
+        assert s1 not in server._sandboxes
+        assert mgr.get(s3)._active_operations == 0
+    finally:
+        server._rlm_end(s2)
+        server._rlm_end(s3)
+
+
+def test_grep_read_signature_policy_block_and_skill_docs_stay_in_sync(tmp_path):
+    from pathlib import Path
+    from rlm_tools import setup_cli
+
+    started = json.loads(_rlm_start(str(tmp_path), "signatures"))
+    try:
+        funcs = " ".join(started["available_functions"])
+        assert "max_matches=None, max_bytes_read=None" in funcs
+    finally:
+        _rlm_end(started["session_id"])
+
+    policy = setup_cli.render_policy_block()
+    assert "`enclosing`" in policy
+    assert "`find_assignments`" in policy
+
+    repo_root = Path(__file__).resolve().parent.parent
+    skill_a = (repo_root / "skills" / "rlm-explore" / "SKILL.md").read_bytes()
+    skill_b = (repo_root / "plugins" / "rlm-tools" / "skills" / "rlm-explore" / "SKILL.md").read_bytes()
+    assert skill_a == skill_b

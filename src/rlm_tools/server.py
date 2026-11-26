@@ -9,15 +9,17 @@ from anyio import Lock, to_thread
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
+from rlm_tools._workspace import scan_limits
 from rlm_tools.access_policy import workspace_policy
 from rlm_tools.helpers import scan_metadata as _scan_metadata
-from rlm_tools.session import Session, SessionManager
+from rlm_tools.session import Session, SessionManager, default_max_memory_bytes
 from rlm_tools.sandbox import Sandbox
 from rlm_tools.llm_bridge import (
     has_configured_provider,
     make_llm_query,
     make_llm_query_batched,
     make_recursive_query,
+    resolve_provider,
 )
 from rlm_tools.semantic import has_configured_scorer, make_evidence_gate, make_scorer
 from rlm_tools.worker_runtime import ALLOWED_MODULES
@@ -28,8 +30,9 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("rlm-tools")
 
 session_manager = SessionManager(
-    max_sessions=int(os.environ.get("RLM_MAX_SESSIONS", "5")),
+    max_sessions=int(os.environ.get("RLM_MAX_SESSIONS", "16")),
     timeout_minutes=int(os.environ.get("RLM_SESSION_TIMEOUT", "10")),
+    idle_evict_seconds=float(os.environ.get("RLM_IDLE_EVICT_SECONDS", "60")),
 )
 
 _sandboxes: dict[str, Sandbox] = {}
@@ -50,7 +53,10 @@ def _cleanup_expired_resources() -> None:
     for session_id in expired_session_ids:
         sandbox = _sandboxes.pop(session_id, None)
         if sandbox:
-            sandbox.close()
+            try:
+                sandbox.close()
+            except Exception:
+                logger.exception("Failed to close expired sandbox for session %s", session_id)
 
 
 def _make_call_reserver(session):
@@ -84,15 +90,45 @@ def _make_recurse_gate(session, reserve=None, deadline=None):
         return None
 
 
+def _default_execution_timeout_seconds(allow_external: bool) -> int:
+    raw = os.environ.get("RLM_EXECUTION_TIMEOUT_SECONDS", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    if allow_external and has_configured_provider():
+        try:
+            if resolve_provider() == "claude-cli":
+                return 180
+        except ValueError:
+            pass
+        return 60
+    return 30
+
+
 def _install_session_llm_tools(session, sandbox: Sandbox) -> bool:
     if not has_configured_provider():
         return False
 
     try:
         _reserve_llm_calls = _make_call_reserver(session)
+        usage_lock = threading.Lock()
+
+        def record_usage(delta: dict[str, int | float]) -> None:
+            with usage_lock:
+                for key, value in delta.items():
+                    prev = session.sub_llm_usage.get(key, 0)
+                    total = prev + value
+                    session.sub_llm_usage[key] = round(total, 6) if isinstance(total, float) else total
+
         gate = _make_recurse_gate(session, reserve=_reserve_llm_calls, deadline=sandbox.execution_deadline)
         base_llm_query = make_llm_query(
-            on_retry=lambda: _reserve_llm_calls(1), deadline=sandbox.execution_deadline,
+            on_retry=lambda: _reserve_llm_calls(1),
+            deadline=sandbox.execution_deadline,
+            on_usage=record_usage,
         )
         llm_query_batched = make_llm_query_batched(base_llm_query, on_batch=_reserve_llm_calls)
 
@@ -109,6 +145,7 @@ def _install_session_llm_tools(session, sandbox: Sandbox) -> bool:
             on_model_call=lambda: _reserve_llm_calls(1),
             gate=gate,
             deadline=sandbox.execution_deadline,
+            on_usage=record_usage,
         )
         recursive_query_batched = make_llm_query_batched(recursive_query)
     except Exception as e:
@@ -128,10 +165,10 @@ def _rlm_start(
     max_output_chars: int = 15_000,
     max_llm_calls: int = 50,
     max_execute_calls: int = 50,
-    execution_timeout_seconds: int = 30,
+    execution_timeout_seconds: int | None = None,
     include_guidance: bool = False,
     include_metadata: bool = False,
-    max_memory_bytes: int = 10_000_000,
+    max_memory_bytes: int | None = None,
     code: str = "",
 ) -> str:
     _cleanup_expired_resources()
@@ -143,6 +180,18 @@ def _rlm_start(
     except (OSError, ValueError, RuntimeError) as exc:
         return json.dumps({"error": str(exc)})
 
+    allow_external = policy.allows_external(root)
+    resolved_timeout = (
+        _default_execution_timeout_seconds(allow_external)
+        if execution_timeout_seconds is None
+        else execution_timeout_seconds
+    )
+    resolved_memory = (
+        default_max_memory_bytes()
+        if max_memory_bytes is None
+        else max_memory_bytes
+    )
+
     try:
         session_id = session_manager.create(
             path=str(root),
@@ -150,11 +199,13 @@ def _rlm_start(
             max_output_chars=max_output_chars,
             max_llm_calls=max_llm_calls,
             max_execute_calls=max_execute_calls,
-            max_memory_bytes=max_memory_bytes,
+            max_memory_bytes=resolved_memory,
             pin=True,
         )
     except RuntimeError as e:
         return json.dumps({"error": str(e)})
+    finally:
+        _cleanup_expired_resources()
 
     session = session_manager.get(session_id)
     if not session:
@@ -162,8 +213,8 @@ def _rlm_start(
 
     try:
         return _initialize_session(
-            session, execution_timeout_seconds, include_guidance, include_metadata,
-            allow_external=policy.allows_external(root),
+            session, resolved_timeout, include_guidance, include_metadata,
+            allow_external=allow_external,
             code=code if has_code else "",
         )
     finally:
@@ -207,13 +258,15 @@ def _initialize_session(
     _sandboxes[session_id] = sandbox
 
     available_functions = [
-        "read_file(path)",
-        "read_files(paths) -> dict[path, content]",
-        "grep(pattern, path='.')",
-        "grep_summary(pattern, path='.') -> compact grouped string",
-        "grep_read(pattern, path='.', max_files=10, context_lines=0) -> {matches, files, summary}",
-        "glob_files(pattern)",
-        "tree(path='.', max_depth=3)",
+        "read_file(path, max_bytes_read=None) -> str",
+        "read_files(paths, max_bytes_read=None) -> dict[path, content]",
+        "grep(pattern, path='.', max_matches=None, allow_partial=False) -> list[{file, line_number, line}] (raises on truncation unless allow_partial=True)",
+        "grep_summary(pattern, path='.', max_matches=None) -> compact grouped str (starts with TRUNCATED if incomplete)",
+        "grep_read(pattern, path='.', max_files=10, context_lines=0, max_matches=None, max_bytes_read=None) -> {matches, files, summary, truncated, limit_hit, files_scanned, files_skipped}",
+        "glob_files(pattern) -> sorted list[str] (raises on truncation)",
+        "tree(path='.', max_depth=3) -> str (starts with TRUNCATED if incomplete)",
+        "enclosing(path, line) -> {line, qualified, chain, spans}",
+        "find_assignments(path, target) -> list[{line_number, kind, target, enclosing, line}]",
     ]
     if has_llm_tools:
         available_functions.extend([
@@ -224,6 +277,7 @@ def _initialize_session(
         ])
     available_functions.append("rlm_finalize(value)")
 
+    active_scan = scan_limits()
     response: dict = {
         "session_id": session_id,
         "metadata": metadata,
@@ -232,6 +286,9 @@ def _initialize_session(
             "max_execute_calls": session.max_execute_calls,
             "max_memory_bytes": session.max_memory_bytes,
             "execution_timeout_seconds": execution_timeout_seconds,
+            "max_scan_bytes": active_scan["max_scan_bytes"],
+            "max_scan_entries": active_scan["max_scan_entries"],
+            "max_scan_seconds": active_scan["max_scan_seconds"],
         },
         "available_functions": available_functions,
         "allowed_imports": sorted(ALLOWED_MODULES),
@@ -288,6 +345,18 @@ def _rlm_execute(
         return _execute_session(session, code, detail_level, max_new_variables, end_session)
 
 
+def _usage_payload(session: Session, memory_bytes_used: int) -> dict:
+    payload: dict = {
+        "execute_calls_used": session.execute_calls,
+        "execute_calls_remaining": session.max_execute_calls - session.execute_calls,
+        "llm_calls_used": session.llm_calls_used,
+        "memory_bytes_used": memory_bytes_used,
+    }
+    if session.sub_llm_usage:
+        payload["sub_llm_usage"] = dict(session.sub_llm_usage)
+    return payload
+
+
 def _execute_session_data(
     session: Session,
     code: str,
@@ -319,12 +388,7 @@ def _execute_session_data(
         response["final"] = result.final
 
     if detail_level in {"usage", "full"}:
-        response["usage"] = {
-            "execute_calls_used": session.execute_calls,
-            "execute_calls_remaining": session.max_execute_calls - session.execute_calls,
-            "llm_calls_used": session.llm_calls_used,
-            "memory_bytes_used": result.memory_bytes_used,
-        }
+        response["usage"] = _usage_payload(session, result.memory_bytes_used)
 
     if detail_level == "full":
         current_vars = set(result.variables)
@@ -333,6 +397,7 @@ def _execute_session_data(
             "read_file", "read_files",
             "grep", "grep_summary", "grep_read",
             "glob_files", "tree",
+            "enclosing", "find_assignments",
             "llm_query", "llm_query_batched",
             "rlm_recurse", "rlm_recurse_batched",
             "rlm_finalize",
@@ -362,6 +427,8 @@ def _execute_session(
     response = _execute_session_data(session, code, detail_level, max_new_variables)
     if end_session and "error" in response:
         if response["error"] is None:
+            if "usage" not in response:
+                response["usage"] = _usage_payload(session, session.memory_bytes_used)
             _close_session(session.session_id)
             response["session_ended"] = True
         else:
@@ -396,10 +463,10 @@ async def rlm_start(
     max_output_chars: Annotated[int, Field(description="Max characters per execute output", ge=100, le=100_000)] = 15_000,
     max_llm_calls: Annotated[int, Field(description="Maximum model calls (llm_query, rlm_recurse, and evidence gate) for this session", ge=1, le=10_000)] = 50,
     max_execute_calls: Annotated[int, Field(description="Maximum rlm_execute calls for this session", ge=1, le=10_000)] = 50,
-    execution_timeout_seconds: Annotated[int, Field(description="Per-rlm_execute timeout in seconds", ge=1, le=300)] = 30,
+    execution_timeout_seconds: Annotated[int | None, Field(description="Per-rlm_execute timeout in seconds (defaults to 30 local, 60 external API, 180 claude-cli)", ge=1, le=600)] = None,
     include_guidance: Annotated[bool, Field(description="Include strategy/example guidance text in the response (larger payload)")] = False,
     include_metadata: Annotated[bool, Field(description="Scan directory and include file counts/types in response (default false for faster startup)")] = False,
-    max_memory_bytes: Annotated[int, Field(description="Maximum in-memory bytes retained for this session", ge=1024, le=100_000_000)] = 10_000_000,
+    max_memory_bytes: Annotated[int | None, Field(description="Maximum in-memory bytes retained for this session (default 64 MiB or RLM_MAX_MEMORY_BYTES)", ge=1024, le=512_000_000)] = None,
     code: Annotated[str, Field(description=(
         "Optional initial Python script (e.g., tree/glob_files/grep_summary) to run right after opening the session; "
         "same helpers and restrictions as rlm_execute."
@@ -418,9 +485,10 @@ async def rlm_execute(
     session_id: Annotated[str, Field(description="Session ID from rlm_start")],
     code: Annotated[str, Field(description=(
         "Python code to execute in the persistent sandbox (variables persist across calls). "
-        "Built-in helpers: read_file(path), read_files(paths), grep(pattern, path='.'), "
-        "grep_summary(pattern, path='.'), grep_read(pattern, path='.', max_files=10, context_lines=0), "
-        "glob_files(pattern), tree(path='.', max_depth=3), rlm_finalize(value). "
+        "Built-in helpers: read_file(path), read_files(paths), grep(pattern, path='.', allow_partial=False), "
+        "grep_summary(pattern, path='.'), grep_read(pattern, path='.', max_files=10, context_lines=0, max_matches=None, max_bytes_read=None), "
+        "glob_files(pattern), tree(path='.', max_depth=3), enclosing(path, line), "
+        "find_assignments(path, target), rlm_finalize(value). "
         "Allowed imports ONLY: re, json, collections, math, fnmatch, itertools, functools, "
         "operator, string, textwrap, difflib, statistics. "
         "Blocked (never use): os, glob, pathlib, ast, open(), exec(), eval(), getattr(), dir(), type(), "

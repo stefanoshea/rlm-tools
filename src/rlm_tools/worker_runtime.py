@@ -225,6 +225,11 @@ class LocalTool:
         return callback(*args, **kwargs)
 
 
+_MISSING = object()
+_EVICT_NODE_BUDGET = 200_000
+_EVICT_MAX_STEPS = 32
+
+
 class WorkerRuntime:
     def __init__(
         self,
@@ -239,8 +244,12 @@ class WorkerRuntime:
         self._max_memory_bytes = max_memory_bytes
         self._namespace: dict = {}
         self._final_result: dict | None = None
-        self._hidden_names = {"__builtins__", "rlm_finalize"}
+        self._protected_bindings: dict[str, object] = {}
         self._setup_namespace()
+
+    def _is_protected_binding(self, name: str, value: object) -> bool:
+        expected = self._protected_bindings.get(name, _MISSING)
+        return expected is not _MISSING and value is expected
 
     def _setup_namespace(self) -> None:
         safe_builtins = {
@@ -249,13 +258,17 @@ class WorkerRuntime:
             and (not k.startswith("_") or k in _ALLOWED_DUNDER_BUILTINS)
         }
         safe_builtins["__import__"] = _make_restricted_import(ALLOWED_MODULES)
+        finalize_tool = LocalTool(self._finalize)
         self._namespace["__builtins__"] = safe_builtins
-        self._namespace["rlm_finalize"] = LocalTool(self._finalize)
+        self._namespace["rlm_finalize"] = finalize_tool
+        self._protected_bindings["__builtins__"] = safe_builtins
+        self._protected_bindings["rlm_finalize"] = finalize_tool
 
     def register_tools(self, names: list[str]) -> None:
         for name in names:
-            self._namespace[name] = HelperProxy(self._conn, name)
-            self._hidden_names.add(name)
+            proxy = HelperProxy(self._conn, name)
+            self._namespace[name] = proxy
+            self._protected_bindings[name] = proxy
 
     def _finalize(self, value):
         self._final_result = {"final": value}
@@ -334,11 +347,15 @@ class WorkerRuntime:
             stdout += "\n... [output truncated]"
 
         memory_bytes_used = self._measure_user_memory(limit=self._max_memory_bytes)
-        if memory_bytes_used > self._max_memory_bytes and error is None:
-            error = (
-                "MemoryError: Session memory limit exceeded: "
-                f"{memory_bytes_used} > {self._max_memory_bytes}"
+        if memory_bytes_used > self._max_memory_bytes:
+            peak_bytes = memory_bytes_used
+            memory_bytes_used, dropped = self._evict_to_fit(peak_bytes)
+            dropped_desc = ", ".join(dropped) if dropped else "user state"
+            mem_error = (
+                f"MemoryError: Session memory limit exceeded ({peak_bytes} > {self._max_memory_bytes}); "
+                f"dropped {dropped_desc} to keep session alive"
             )
+            error = f"{error}\n{mem_error}" if error is not None else mem_error
 
         return ExecuteResponse(
             stdout=stdout,
@@ -348,31 +365,96 @@ class WorkerRuntime:
             memory_bytes_used=memory_bytes_used,
         )
 
+    def _evict_to_fit(self, peak_bytes: int) -> tuple[int, list[str]]:
+        dropped: list[str] = []
+        current = peak_bytes
+        if self._final_result is not None:
+            self._final_result = None
+            dropped.append("<final>")
+            current = self._measure_user_memory(limit=self._max_memory_bytes)
+            if current <= self._max_memory_bytes:
+                return current, dropped
+
+        candidates: list[tuple[int, str]] = []
+        remaining_nodes = _EVICT_NODE_BUDGET
+        budget_exhausted = False
+        for name, value in list(self._namespace.items()):
+            if self._is_protected_binding(name, value) or issubclass(type(value), ModuleType):
+                continue
+            if remaining_nodes <= 0:
+                budget_exhausted = True
+                break
+            seen_item: set[int] = set()
+            size = self._deep_size(
+                value, seen_item, self._max_memory_bytes, max_nodes=remaining_nodes,
+            )
+            remaining_nodes -= len(seen_item)
+            if remaining_nodes <= 0:
+                budget_exhausted = True
+            candidates.append((size, name))
+
+        if not budget_exhausted and candidates:
+            candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            steps = 0
+            for _, victim in candidates:
+                if current <= self._max_memory_bytes or steps >= _EVICT_MAX_STEPS:
+                    break
+                if victim in self._namespace:
+                    self._namespace.pop(victim, None)
+                    dropped.append(victim)
+                    steps += 1
+                    current = self._measure_user_memory(
+                        limit=self._max_memory_bytes, max_nodes=_EVICT_NODE_BUDGET,
+                    )
+
+        if current > self._max_memory_bytes:
+            for name, value in list(self._namespace.items()):
+                if self._is_protected_binding(name, value) or issubclass(type(value), ModuleType):
+                    continue
+                self._namespace.pop(name, None)
+                dropped.append(name)
+            current = self._measure_user_memory(limit=self._max_memory_bytes)
+        return current, dropped
+
     def list_variables(self) -> list[str]:
         return [
-            key for key in self._namespace
-            if not key.startswith("_") and key not in self._hidden_names
+            key for key, value in self._namespace.items()
+            if not key.startswith("_") and not self._is_protected_binding(key, value)
         ]
 
-    def _measure_user_memory(self, limit: int | None = None) -> int:
+    def _measure_user_memory(
+        self, limit: int | None = None, *, max_nodes: int | None = None,
+    ) -> int:
         seen: set[int] = set()
         total = 0
         for name, value in self._namespace.items():
-            if name in self._hidden_names:
+            if self._is_protected_binding(name, value):
                 continue
             remaining = None if limit is None else limit - total
-            total += self._deep_size(value, seen, remaining)
+            remaining_nodes = None if max_nodes is None else max(0, max_nodes - len(seen))
+            total += self._deep_size(value, seen, remaining, max_nodes=remaining_nodes)
             # Stop walking the object graph once we know the cap is blown; the
             # exact over-limit figure does not matter, only that it is over.
             if limit is not None and total > limit:
                 return total
+            if max_nodes is not None and len(seen) >= max_nodes:
+                return (limit + 1) if limit is not None else total
         if self._final_result is not None:
             remaining = None if limit is None else limit - total
-            total += self._deep_size(self._final_result, seen, remaining)
+            remaining_nodes = None if max_nodes is None else max(0, max_nodes - len(seen))
+            total += self._deep_size(self._final_result, seen, remaining, max_nodes=remaining_nodes)
         return total
 
-    def _deep_size(self, value, seen: set[int], limit: int | None) -> int:
+    def _deep_size(
+        self,
+        value,
+        seen: set[int],
+        limit: int | None,
+        *,
+        max_nodes: int | None = None,
+    ) -> int:
         size = 0
+        visited = 0
         stack = [iter((value,))]
         while stack:
             try:
@@ -383,7 +465,10 @@ class WorkerRuntime:
             obj_id = id(item)
             if obj_id in seen or issubclass(type(item), ModuleType):
                 continue
+            if max_nodes is not None and visited >= max_nodes:
+                return (limit + 1) if limit is not None else size
             seen.add(obj_id)
+            visited += 1
             size += _shallow_size(item)
             if limit is not None and size > limit:
                 break

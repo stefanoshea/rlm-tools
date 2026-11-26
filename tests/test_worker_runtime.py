@@ -92,39 +92,73 @@ def test_stopped_worker_reports_unavailability(tmp_path):
         sandbox.close()
 
 
-def test_reported_memory_limit_includes_helper_cache(tmp_path):
+def test_reported_memory_limit_evicts_helper_cache_first(tmp_path):
     (tmp_path / "sample.txt").write_text("a" * 500)
     sandbox = Sandbox(base_path=str(tmp_path), max_memory_bytes=1000)
     try:
         result = sandbox.execute("read_file('sample.txt')\nvalue = 'b' * 600")
-        assert result.error.startswith("MemoryError:")
-        assert result.memory_bytes_used > 1000
-        assert sandbox.memory_bytes_used == 500
-        assert sandbox.list_variables() == []
-        assert "closed after exceeding" in sandbox.execute("print(1)").error
+        assert result.error is None
+        assert sandbox.memory_bytes_used <= 1000
+        assert "value" in sandbox.list_variables()
     finally:
         sandbox.close()
 
 
-def test_over_limit_final_value_is_discarded(tmp_path):
+def test_over_limit_final_value_is_dropped_without_killing_worker(tmp_path):
     sandbox = Sandbox(base_path=str(tmp_path), max_memory_bytes=1000)
     try:
+        sandbox.execute("small = 42")
         result = sandbox.execute("rlm_finalize('a' * 2000)")
 
-        assert "worker state was discarded" in result.error
+        assert result.error is not None
+        assert "MemoryError:" in result.error
+        assert "dropped <final>" in result.error
         assert result.final is None
-        assert sandbox._process.poll() is not None
+        assert sandbox._process.poll() is None
+        follow_up = sandbox.execute("print(small)")
+        assert follow_up.error is None
+        assert follow_up.stdout == "42\n"
     finally:
         sandbox.close()
 
 
-def test_memory_budget_counts_private_user_variables(tmp_path):
+def test_memory_budget_evicts_largest_vars_including_private_and_keeps_imports(tmp_path):
     sandbox = Sandbox(base_path=str(tmp_path), max_memory_bytes=1000)
     try:
+        sandbox.execute("import re\nsmall = 'ok'")
         result = sandbox.execute("_scratch = 'a' * 2000")
 
+        assert result.error is not None
+        assert "MemoryError:" in result.error
+        assert "dropped _scratch" in result.error
+        assert sandbox.memory_bytes_used <= 1000
+        alive = sandbox.execute("print(small, bool(re.match('a', 'a')))")
+        assert alive.error is None
+        assert alive.stdout == "ok True\n"
+    finally:
+        sandbox.close()
+
+
+def test_parent_hard_kill_backstop_triggers_if_worker_still_exceeds_limit(tmp_path, monkeypatch):
+    sandbox = Sandbox(base_path=str(tmp_path), max_memory_bytes=1000)
+    try:
+        monkeypatch.setattr(
+            sandbox,
+            "_parent_conn",
+            sandbox._parent_conn,
+        )
+        orig_receive = __import__("rlm_tools.sandbox", fromlist=["receive_message"]).receive_message
+
+        def fake_receive(conn, deadline=None):
+            msg = orig_receive(conn, deadline)
+            if msg.get("type") == "execute_result":
+                msg["memory_bytes_used"] = 5000
+            return msg
+
+        monkeypatch.setattr("rlm_tools.sandbox.receive_message", fake_receive)
+        result = sandbox.execute("x = 1")
         assert "worker state was discarded" in result.error
-        assert sandbox.memory_bytes_used == 0
+        assert sandbox._process.poll() is not None
     finally:
         sandbox.close()
 
@@ -231,3 +265,38 @@ def test_sandbox_context_manager_closes_worker(tmp_path):
         process = sandbox._process
         assert process.poll() is None
     assert process.poll() is not None
+
+
+def test_rebinding_protected_helper_name_is_counted_and_evicted():
+    runtime = _runtime(max_memory_bytes=4_000)
+    runtime.register_tools(["tree"])
+
+    # Unmodified helper stays hidden and uncounted.
+    assert runtime.list_variables() == []
+    assert runtime._measure_user_memory() == 0
+
+    # Rebinding a helper name to a large user payload must be measured and evicted.
+    result = runtime.execute("tree = 'x' * 10_000")
+    assert result.error is not None
+    assert "MemoryError:" in result.error
+    assert "tree" in result.error
+    assert result.memory_bytes_used <= 4_000
+    assert "tree" not in runtime._namespace
+
+
+def test_evict_to_fit_shared_graph_aliases_is_bounded_and_preserves_modules():
+    runtime = _runtime(max_memory_bytes=16_000)
+    t0 = time.monotonic()
+    result = runtime.execute(
+        "import re\n"
+        "shared = [f'{i}-' + 'x' * 200 for i in range(200)]\n"
+        "aliases = {f'v{i}': shared for i in range(60)}\n"
+        "a0 = a1 = a2 = a3 = a4 = a5 = a6 = a7 = a8 = a9 = shared\n"
+    )
+    elapsed = time.monotonic() - t0
+    assert elapsed < 2.0
+    assert result.error is not None
+    assert "MemoryError:" in result.error
+    assert result.memory_bytes_used <= 16_000
+    # Imported stdlib module remains intact after eviction.
+    assert "re" in runtime._namespace

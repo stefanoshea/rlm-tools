@@ -1,8 +1,23 @@
-import uuid
-import time
+import os
 import threading
+import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+
+
+DEFAULT_MAX_MEMORY_BYTES = 64 * 1024 * 1024
+
+
+def default_max_memory_bytes() -> int:
+    raw = os.environ.get("RLM_MAX_MEMORY_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_MAX_MEMORY_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_MEMORY_BYTES
+    return value if value >= 1024 else DEFAULT_MAX_MEMORY_BYTES
 
 
 @dataclass
@@ -19,7 +34,8 @@ class Session:
     max_execute_calls: int = 50
     execute_calls: int = 0
     memory_bytes_used: int = 0
-    max_memory_bytes: int = 10_000_000
+    max_memory_bytes: int = field(default_factory=default_max_memory_bytes)
+    sub_llm_usage: dict[str, int | float] = field(default_factory=dict)
     _operation_ready: threading.Condition = field(default_factory=threading.Condition, repr=False, compare=False)
     _next_operation: int = field(default=0, init=False, repr=False, compare=False)
     _current_operation: int = field(default=0, init=False, repr=False, compare=False)
@@ -27,10 +43,16 @@ class Session:
 
 
 class SessionManager:
-    def __init__(self, max_sessions: int = 5, timeout_minutes: int = 10):
+    def __init__(
+        self,
+        max_sessions: int = 16,
+        timeout_minutes: int = 10,
+        idle_evict_seconds: float = 60.0,
+    ):
         self._sessions: dict[str, Session] = {}
         self._max_sessions = max_sessions
         self._timeout_seconds = timeout_minutes * 60
+        self._idle_evict_seconds = max(0.0, float(idle_evict_seconds))
         self._lock = threading.Lock()
         self._expired_session_ids: list[str] = []
 
@@ -41,16 +63,37 @@ class SessionManager:
         max_output_chars: int = 15_000,
         max_llm_calls: int = 50,
         max_execute_calls: int = 50,
-        max_memory_bytes: int = 10_000_000,
+        max_memory_bytes: int | None = None,
         *,
         pin: bool = False,
     ) -> str:
+        resolved_memory = default_max_memory_bytes() if max_memory_bytes is None else max_memory_bytes
         with self._lock:
             self._cleanup_expired_locked()
             if len(self._sessions) >= self._max_sessions:
-                raise RuntimeError(
-                    f"Cannot create session: max sessions ({self._max_sessions}) reached"
-                )
+                now = time.time()
+                evictable = [
+                    s for s in self._sessions.values()
+                    if not s._active_operations and (now - s.last_used) >= self._idle_evict_seconds
+                ]
+                if evictable:
+                    victim = min(evictable, key=lambda s: s.last_used)
+                    self._sessions.pop(victim.session_id, None)
+                    self._expired_session_ids.append(victim.session_id)
+                else:
+                    summary_items = []
+                    for sid, s in sorted(self._sessions.items(), key=lambda kv: kv[1].last_used):
+                        idle = int(max(0.0, now - s.last_used))
+                        state = f"active={s._active_operations}" if s._active_operations else f"idle={idle}s"
+                        summary_items.append(f"{sid} ({s.path}, {state})")
+                    summary = "; ".join(summary_items[:10])
+                    if len(summary_items) > 10:
+                        summary += f"; +{len(summary_items) - 10} more"
+                    raise RuntimeError(
+                        f"Cannot create session: max sessions ({self._max_sessions}) reached "
+                        f"(no idle sessions >= {int(self._idle_evict_seconds)}s to evict). "
+                        f"Open sessions: [{summary}]. Close finished sessions with end_session=true or rlm_end."
+                    )
             session_id = uuid.uuid4().hex[:12]
             self._sessions[session_id] = Session(
                 session_id=session_id,
@@ -59,7 +102,7 @@ class SessionManager:
                 max_output_chars=max_output_chars,
                 max_llm_calls=max_llm_calls,
                 max_execute_calls=max_execute_calls,
-                max_memory_bytes=max_memory_bytes,
+                max_memory_bytes=resolved_memory,
             )
             if pin:
                 session = self._sessions[session_id]

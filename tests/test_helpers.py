@@ -402,11 +402,17 @@ def test_grep_ignores_incomplete_line_when_file_is_truncated(tmp_path, monkeypat
     with pytest.raises(RuntimeError, match="scan truncated"):
         helpers["grep"](pattern)
     summary = helpers["grep_summary"](pattern)
+    assert summary.startswith("TRUNCATED (")
     assert "L1: match" in summary
     assert "L2:" not in summary
     assert "scan truncated" in summary
-    assert helpers["grep_summary"]("absent") == "[scan truncated: workspace limit reached]"
-    assert "scan truncated" in helpers["grep_read"]("absent")["summary"]
+    absent_summary = helpers["grep_summary"]("absent")
+    assert absent_summary.startswith("TRUNCATED (")
+    assert "scan truncated" in absent_summary
+    read_res = helpers["grep_read"]("absent")
+    assert read_res["summary"].startswith("TRUNCATED (")
+    assert read_res["truncated"] is True
+    assert read_res["limit_hit"] == "file_bytes"
 
 
 def test_grep_rejects_unsupported_pattern_without_a_fallback(tmp_path):
@@ -459,4 +465,326 @@ def test_automatic_result_limit_reports_truncation(tmp_path, monkeypatch):
         helpers["grep"]("example")
     with pytest.raises(RuntimeError, match="scan truncated"):
         helpers["glob_files"]("*")
-    assert "scan truncated" in helpers["tree"]()
+    tree_out = helpers["tree"]()
+    assert tree_out.startswith("TRUNCATED (")
+    assert "scan truncated" in tree_out
+
+
+def test_gitignore_filtering_and_nested_rules(tmp_path):
+    (tmp_path / ".gitignore").write_text(
+        "# comment\n"
+        "*.log\n"
+        "!important.log\n"
+        "ignored_dir/\n"
+        "/root_only.txt\n"
+        "**/generated/*.py\n"
+    )
+    (tmp_path / "app.py").write_text("needle\n")
+    (tmp_path / "debug.log").write_text("needle\n")
+    (tmp_path / "important.log").write_text("needle\n")
+    (tmp_path / "root_only.txt").write_text("needle\n")
+    (tmp_path / "ignored_dir").mkdir()
+    (tmp_path / "ignored_dir" / "secret.py").write_text("needle\n")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "root_only.txt").write_text("needle\n")
+    (tmp_path / "sub" / ".gitignore").write_text("local_ignore.py\n")
+    (tmp_path / "sub" / "local_ignore.py").write_text("needle\n")
+    (tmp_path / "sub" / "generated").mkdir()
+    (tmp_path / "sub" / "generated" / "gen.py").write_text("needle\n")
+
+    helpers, _ = make_helpers(str(tmp_path))
+    files = [m["file"] for m in helpers["grep"]("needle")]
+    assert files == ["app.py", "important.log", "sub/root_only.txt"]
+    tree_out = helpers["tree"](max_depth=4)
+    assert "ignored_dir" not in tree_out
+    assert "local_ignore.py" not in tree_out
+
+
+def test_gitignore_symlink_is_ignored_safely(tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("*.py\n")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".gitignore").symlink_to(outside)
+    (repo / "keep.py").write_text("needle\n")
+
+    helpers, _ = make_helpers(str(repo))
+    assert [m["file"] for m in helpers["grep"]("needle")] == ["keep.py"]
+
+
+def test_binary_nul_and_minified_files_skipped_before_byte_budget(tmp_path, monkeypatch):
+    monkeypatch.setenv("RLM_MAX_SCAN_BYTES", "200")
+    (tmp_path / "nul_blob.dat").write_bytes(b"needle\x00" + b"x" * 5000)
+    (tmp_path / "big.min.json").write_bytes(b"{" + b'"a":1,' * 250_000 + b'"needle":1}')
+    (tmp_path / "real.py").write_text("needle = 1\n")
+
+    from rlm_tools import helpers as helper_module
+    monkeypatch.setattr(helper_module, "_MINIFIED_SIZE_CAP", 1024)
+
+    helpers, _ = make_helpers(str(tmp_path))
+    res = helpers["grep_read"]("needle")
+    assert res["truncated"] is False
+    assert res["files_scanned"] == 1
+    assert res["files_skipped"] == 2
+    assert list(res["matches"]) == ["real.py"]
+
+
+def test_scan_limit_env_overrides_and_partial_grep(tmp_path, monkeypatch):
+    monkeypatch.setenv("RLM_MAX_SCAN_ENTRIES", "2")
+    for idx in range(5):
+        (tmp_path / f"f{idx}.py").write_text("hit = 1\n")
+
+    helpers, _ = make_helpers(str(tmp_path))
+    with pytest.raises(RuntimeError, match="TRUNCATED \\(2 entry scan limit"):
+        helpers["grep"]("hit")
+
+    partial = helpers["grep"]("hit", allow_partial=True)
+    assert len(partial) <= 2
+
+    summary = helpers["grep_summary"]("hit")
+    assert summary.splitlines()[0].startswith("TRUNCATED (2 entry scan limit;")
+
+
+def test_grep_clips_long_lines_around_match(tmp_path):
+    long_line = ("a" * 600) + "NEEDLE_TOKEN" + ("b" * 600)
+    (tmp_path / "big.txt").write_text(long_line + "\n")
+
+    helpers, _ = make_helpers(str(tmp_path))
+    matches = helpers["grep"]("NEEDLE_TOKEN")
+    assert len(matches) == 1
+    assert "NEEDLE_TOKEN" in matches[0]["line"]
+    assert len(matches[0]["line"]) <= 500
+
+    summary = helpers["grep_summary"]("NEEDLE_TOKEN")
+    assert "NEEDLE_TOKEN" in summary
+    match_lines = [ln for ln in summary.splitlines() if "L1:" in ln]
+    assert len(match_lines) == 1
+    assert len(match_lines[0]) <= 320
+
+
+def test_dir_cache_invalidates_when_file_added(tmp_path):
+    (tmp_path / "a.py").write_text("token = 1\n")
+    helpers, _ = make_helpers(str(tmp_path))
+    assert [m["file"] for m in helpers["grep"]("token")] == ["a.py"]
+
+    (tmp_path / "b.py").write_text("token = 2\n")
+    st = os.stat(tmp_path)
+    os.utime(tmp_path, (st.st_atime, st.st_mtime + 10))
+    assert [m["file"] for m in helpers["grep"]("token")] == ["a.py", "b.py"]
+
+
+def test_ast_enclosing_and_find_assignments(tmp_path):
+    sample = tmp_path / "flow.py"
+    sample.write_text(
+        "TOP = 1\n"
+        "\n"
+        "class RunFlow:\n"
+        "    def __init__(self):\n"
+        "        self.table_envelopes: list[str] = []\n"
+        "\n"
+        "    async def run(self):\n"
+        "        def _nested_helper():\n"
+        "            return 1\n"
+        "\n"
+        "        self.table_envelopes += ['a']\n"
+        "        if (x := len(self.table_envelopes)) > 0:\n"
+        "            self.table_envelopes = ['b']\n"
+        "        return x\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "broken.py").write_text("def oops(:\n", encoding="utf-8")
+
+    helpers, _ = make_helpers(str(tmp_path))
+    assert helpers["enclosing"]("flow.py", 1)["qualified"] == "<module>"
+    assert helpers["enclosing"]("flow.py", 9)["qualified"] == "RunFlow.run._nested_helper"
+    # Line 11 is after _nested_helper closed: must resolve to RunFlow.run, not _nested_helper
+    enc = helpers["enclosing"]("flow.py", 11)
+    assert enc["qualified"] == "RunFlow.run"
+    assert enc["chain"] == ["RunFlow", "run"]
+
+    hits = helpers["find_assignments"]("flow.py", "self.table_envelopes")
+    assert [(h["line_number"], h["kind"], h["enclosing"]) for h in hits] == [
+        (5, "ann_assign", "RunFlow.__init__"),
+        (11, "aug_assign", "RunFlow.run"),
+        (13, "assign", "RunFlow.run"),
+    ]
+    named = helpers["find_assignments"]("flow.py", "x")
+    assert [(h["line_number"], h["kind"], h["enclosing"]) for h in named] == [
+        (12, "named_expr", "RunFlow.run"),
+    ]
+
+    with pytest.raises(ValueError, match="parse Python AST"):
+        helpers["enclosing"]("broken.py", 1)
+
+
+def test_gitignore_char_classes_escapes_reinclusion_redos_and_explicit_subdirs(tmp_path):
+    import time as _time
+    from rlm_tools._workspace import _compile_gitignore_glob
+
+    # ReDoS regression: adversarial repeated wildcards must finish in <50ms under RE2.
+    adversarial = _compile_gitignore_glob("*a*a*a*a*a*a*a*a*a*a*a*a*a*b")
+    t0 = _time.monotonic()
+    assert adversarial.match("a" * 29 + "c") is None
+    assert (_time.monotonic() - t0) < 0.05
+
+    # Character classes: negated [!a-z], leading ] in negated [!]], range spanning '/' [.-0], empty [/].
+    assert _compile_gitignore_glob("[!a-z].txt").match("1.txt") is not None
+    assert _compile_gitignore_glob("[!a-z].txt").match("a.txt") is None
+    assert _compile_gitignore_glob("[!]].txt").match("].txt") is None
+    assert _compile_gitignore_glob("[!]].txt").match("a.txt") is not None
+    assert _compile_gitignore_glob("[!-a].txt").match("-.txt") is None
+    assert _compile_gitignore_glob("[!-a].txt").match("a.txt") is None
+    assert _compile_gitignore_glob("[!-a].txt").match("0.txt") is not None
+    r_span = _compile_gitignore_glob("[.-0].txt")
+    assert r_span.match("..txt") is not None
+    assert r_span.match("0.txt") is not None
+    assert r_span.match("/.txt") is None
+    assert _compile_gitignore_glob("[/]").match("/") is None
+
+    # Escaped leading !, #, trailing space, and explicit subdir targets.
+    (tmp_path / ".gitignore").write_text(
+        "\\!important.txt\n"
+        "\\#hash.txt\n"
+        "trailing\\ \n"
+        "ignored_dir/\n"
+        "/anchored_ignored\n"
+        "bare_ignored\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "!important.txt").write_text("needle\n", encoding="utf-8")
+    (tmp_path / "#hash.txt").write_text("needle\n", encoding="utf-8")
+    (tmp_path / "trailing ").write_text("needle\n", encoding="utf-8")
+    (tmp_path / "keep.py").write_text("needle\n", encoding="utf-8")
+    for dirname in ("ignored_dir", "anchored_ignored", "bare_ignored"):
+        sub = tmp_path / dirname / "sub"
+        sub.mkdir(parents=True)
+        (sub / "secret.py").write_text("needle\n", encoding="utf-8")
+
+    helpers, _ = make_helpers(str(tmp_path))
+    assert [m["file"] for m in helpers["grep"]("needle", ".")] == ["keep.py"]
+    for dirname in ("ignored_dir", "anchored_ignored", "bare_ignored"):
+        assert helpers["grep"]("needle", dirname) == []
+        assert helpers["grep"]("needle", f"{dirname}/sub") == []
+        assert helpers["tree"](dirname) == dirname
+        assert helpers["tree"](f"{dirname}/sub") == f"{dirname}/sub"
+
+    # Directory re-inclusion: * + !*/ + !*.py and foo/** + !foo/keep.py.
+    sub_repo = tmp_path / "reincl"
+    sub_repo.mkdir()
+    (sub_repo / ".gitignore").write_text(
+        "*\n!*/\n!*.py\nfoo/**\n!foo/keep.py\n",
+        encoding="utf-8",
+    )
+    (sub_repo / "pkg").mkdir()
+    (sub_repo / "pkg" / "ok.py").write_text("hit\n", encoding="utf-8")
+    (sub_repo / "pkg" / "drop.txt").write_text("hit\n", encoding="utf-8")
+    (sub_repo / "foo").mkdir()
+    (sub_repo / "foo" / "keep.py").write_text("hit\n", encoding="utf-8")
+    (sub_repo / "foo" / "drop.py").write_text("hit\n", encoding="utf-8")
+    sub_helpers, _ = make_helpers(str(sub_repo))
+    assert [m["file"] for m in sub_helpers["grep"]("hit", ".")] == ["foo/keep.py", "pkg/ok.py"]
+
+
+def test_multibyte_utf8_line_clipping_preserves_match(tmp_path):
+    from rlm_tools.helpers import MAX_GREP_LINE_BYTES, MAX_SUMMARY_LINE_CHARS
+
+    (tmp_path / "utf8.txt").write_text("あ" * 300 + "NEEDLE_TOKEN" + "あ" * 300 + "\n", encoding="utf-8")
+    helpers, _ = make_helpers(str(tmp_path))
+
+    hits = helpers["grep"]("NEEDLE_TOKEN", ".")
+    assert len(hits) == 1
+    assert "NEEDLE_TOKEN" in hits[0]["line"]
+    assert len(hits[0]["line"].encode("utf-8")) <= MAX_GREP_LINE_BYTES
+
+    summary = helpers["grep_summary"]("NEEDLE_TOKEN", ".")
+    assert "NEEDLE_TOKEN" in summary
+    match_line = [ln for ln in summary.splitlines() if "L1:" in ln][0]
+    clipped_part = match_line.split("L1: ", 1)[1]
+    assert len(clipped_part.encode("utf-8")) <= MAX_SUMMARY_LINE_CHARS
+
+
+def test_ast_helpers_deep_expr_formfeed_dotted_receiver_and_cache_eviction(tmp_path):
+    # >1500 deep binary op and attribute chain must not raise RecursionError.
+    deep_expr = "x = " + " + ".join(["1"] * 1500) + "\n"
+    deep_attr = ".".join(["a"] * 1200) + " = 1\n"
+    (tmp_path / "deep.py").write_text(deep_expr + deep_attr, encoding="utf-8")
+
+    # Form feed (\f) and U+2028 inside comments must not desync AST lineno.
+    (tmp_path / "ff.py").write_text(
+        "a = 1\n# \x0c page break \u2028 line\nb = 2\n",
+        encoding="utf-8",
+    )
+
+    # Call/subscript receivers, decorators, and unpacking targets.
+    (tmp_path / "complex.py").write_text(
+        "@dec\n"
+        "def fn():\n"
+        "    other().config = 1\n"
+        "    get_obj().self.items = 2\n"
+        "    (first, *rest), mapping[0] = [1, 2, 3], 4\n"
+        "    return first\n",
+        encoding="utf-8",
+    )
+
+    helpers, workspace = make_helpers(str(tmp_path))
+    assert helpers["enclosing"]("deep.py", 1)["qualified"] == "<module>"
+    deep_hits = helpers["find_assignments"]("deep.py", "x")
+    assert len(deep_hits) == 1 and deep_hits[0]["line_number"] == 1
+
+    ff_hits = helpers["find_assignments"]("ff.py", "b")
+    assert len(ff_hits) == 1
+    assert ff_hits[0]["line_number"] == 3
+    assert ff_hits[0]["line"] == "b = 2"
+
+    # Decorator line (line 1) resolves to fn.
+    assert helpers["enclosing"]("complex.py", 1)["qualified"] == "fn"
+    # Call receiver must not match bare or self-prefixed names.
+    assert helpers["find_assignments"]("complex.py", "config") == []
+    assert helpers["find_assignments"]("complex.py", "self.items") == []
+    # Tuple, starred, and subscript unpacking targets must match.
+    assert [h["target"] for h in helpers["find_assignments"]("complex.py", "first")] == ["first"]
+    assert [h["target"] for h in helpers["find_assignments"]("complex.py", "rest")] == ["rest"]
+    assert [h["target"] for h in helpers["find_assignments"]("complex.py", "mapping")] == ["mapping"]
+
+    # evict_cache clears both file/ast caches and workspace._dir_cache.
+    helpers["tree"](".")
+    assert len(workspace._dir_cache) > 0
+    workspace._evict_file_cache()
+    assert len(workspace._dir_cache) == 0
+
+
+def test_exact_scan_byte_limit_and_lru_file_cache_and_tree_truncation_banner(tmp_path, monkeypatch):
+    # Exact RLM_MAX_SCAN_BYTES == st_size without trailing newline must be complete=True.
+    (tmp_path / "exact.txt").write_text("0123456789", encoding="utf-8")
+    monkeypatch.setenv("RLM_MAX_SCAN_BYTES", "10")
+    helpers, _ = make_helpers(str(tmp_path))
+    hits = helpers["grep"]("0123456789", ".")
+    assert len(hits) == 1 and hits[0]["line"] == "0123456789"
+    assert helpers["read_file"]("exact.txt") == "0123456789"
+
+    # tree() truncation banner reports entries visited instead of '0 files scanned'.
+    monkeypatch.delenv("RLM_MAX_SCAN_BYTES", raising=False)
+    monkeypatch.setenv("RLM_MAX_SCAN_ENTRIES", "2")
+    for idx in range(5):
+        (tmp_path / f"f{idx}.txt").write_text("x\n", encoding="utf-8")
+    tree_out = helpers["tree"](".")
+    assert tree_out.startswith("TRUNCATED (2 entry scan limit;")
+    assert "0 files scanned" not in tree_out
+    assert "entries visited" in tree_out
+
+    # LRU file_cache evicts oldest entries under memory_tracker cap.
+    monkeypatch.delenv("RLM_MAX_SCAN_ENTRIES", raising=False)
+    tracked = {"bytes": 0}
+
+    def tracker(delta: int) -> None:
+        if delta > 0 and tracked["bytes"] + delta > 15:
+            raise MemoryError("cap")
+        tracked["bytes"] = max(0, tracked["bytes"] + delta)
+
+    (tmp_path / "a.txt").write_text("a" * 10, encoding="utf-8")
+    (tmp_path / "b.txt").write_text("b" * 10, encoding="utf-8")
+    lru_helpers, _ = make_helpers(str(tmp_path), memory_tracker=tracker)
+    assert lru_helpers["read_file"]("a.txt") == "a" * 10
+    assert tracked["bytes"] == 10
+    assert lru_helpers["read_file"]("b.txt") == "b" * 10
+    assert tracked["bytes"] == 10
