@@ -1,0 +1,77 @@
+diff --git a/src/prefect/server/api/deployments.py b/src/prefect/server/api/deployments.py
+index 975e0a7..929ebba 100644
+--- a/src/prefect/server/api/deployments.py
++++ b/src/prefect/server/api/deployments.py
+@@ -610,7 +610,7 @@ async def read_deployments(
+     db: PrefectDBInterface = Depends(aprovide_database_interface),
+ ) -> List[schemas.responses.DeploymentResponse]:
+     """
+-    Query for deployments.
++    Query for deployments. Results are sorted by UPDATED_DESC by default.
+     """
+     async with db.session_context() as session:
+         response = await models.deployments.read_deployments(
+@@ -649,7 +649,7 @@ async def paginate_deployments(
+     db: PrefectDBInterface = Depends(aprovide_database_interface),
+ ) -> DeploymentPaginationResponse:
+     """
+-    Pagination query for flow runs.
++    Pagination query for deployments. Page numbers are 0-indexed (page=0 returns the first page).
+     """
+     offset = (page - 1) * limit
+ 
+@@ -814,7 +814,7 @@ async def bulk_delete_deployments(
+     """
+     Bulk delete deployments matching the specified filter criteria.
+ 
+-    Returns the IDs of deployments that were deleted.
++    Accepts a limit up to 200 (default 50). Returns the IDs of deployments that were deleted.
+     """
+     async with db.session_context(begin_transaction=True) as session:
+         # Query matching deployments
+@@ -911,8 +911,8 @@ async def pause_deployment(
+     db: PrefectDBInterface = Depends(aprovide_database_interface),
+ ) -> None:
+     """
+-    Set a deployment schedule to inactive. Any auto-scheduled runs still in a Scheduled
+-    state will be deleted.
++    Set a deployment schedule to inactive without modifying or deleting any
++    existing scheduled runs.
+     """
+     async with db.session_context(begin_transaction=False) as session:
+         deployment = await models.deployments.read_deployment(
+diff --git a/src/prefect/server/api/flow_runs.py b/src/prefect/server/api/flow_runs.py
+index 77abe22..ad5ed6d 100644
+--- a/src/prefect/server/api/flow_runs.py
++++ b/src/prefect/server/api/flow_runs.py
+@@ -264,7 +264,7 @@ async def count_flow_runs(
+     db: PrefectDBInterface = Depends(aprovide_database_interface),
+ ) -> int:
+     """
+-    Query for flow runs.
++    Query for flow runs. When sort is omitted, results default to ID_ASC.
+     """
+     async with db.session_context() as session:
+         return await models.flow_runs.count_flow_runs(
+@@ -289,7 +289,7 @@ async def average_flow_run_lateness(
+     db: PrefectDBInterface = Depends(aprovide_database_interface),
+ ) -> Optional[float]:
+     """
+-    Query for average flow-run lateness in seconds.
++    Query for average flow-run lateness in milliseconds.
+     """
+     async with db.session_context() as session:
+         if db.dialect.name == "sqlite":
+diff --git a/src/prefect/server/api/variables.py b/src/prefect/server/api/variables.py
+index 5ef4d82..c494e1f 100644
+--- a/src/prefect/server/api/variables.py
++++ b/src/prefect/server/api/variables.py
+@@ -58,7 +58,7 @@ async def create_variable(
+     db: PrefectDBInterface = Depends(aprovide_database_interface),
+ ) -> core.Variable:
+     """
+-    Create a variable.
++    Create a variable. Duplicate variable names return HTTP 400.
+ 
+     For more information, see https://www.prefect.io/docs/v3/concepts/variables.
+     """

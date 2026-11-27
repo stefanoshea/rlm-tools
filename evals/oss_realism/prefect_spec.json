@@ -1,0 +1,63 @@
+{
+  "repo_url": "https://github.com/PrefectHQ/prefect.git",
+  "commit_sha": "5f7d879aa1636e42ca6697548c5c0065dafbff7a",
+  "patch_file": "prefect_planted_bugs.patch",
+  "scope_files": [
+    "src/prefect/server/api/deployments.py",
+    "src/prefect/server/api/flow_runs.py",
+    "src/prefect/server/api/variables.py"
+  ],
+  "endpoint_count": 50,
+  "planted_bugs": [
+    {
+      "item": "read_deployments",
+      "file": "src/prefect/server/api/deployments.py",
+      "bug_kind": "wrong_default_sort",
+      "description_claim": "Results are sorted by UPDATED_DESC by default.",
+      "actual_behavior": "sort defaults to DeploymentSort.NAME_ASC."
+    },
+    {
+      "item": "paginate_deployments",
+      "file": "src/prefect/server/api/deployments.py",
+      "bug_kind": "indexing_mismatch",
+      "description_claim": "Page numbers are 0-indexed (page=0 returns the first page).",
+      "actual_behavior": "page defaults to 1 with ge=1 and offset = (page - 1) * limit (1-indexed)."
+    },
+    {
+      "item": "bulk_delete_deployments",
+      "file": "src/prefect/server/api/deployments.py",
+      "bug_kind": "wrong_limit_cap",
+      "description_claim": "Accepts a limit up to 200 (default 50).",
+      "actual_behavior": "limit has le=BULK_OPERATION_LIMIT where BULK_OPERATION_LIMIT = 50."
+    },
+    {
+      "item": "pause_deployment",
+      "file": "src/prefect/server/api/deployments.py",
+      "bug_kind": "undocumented_destructive_side_effect",
+      "description_claim": "Sets schedule inactive without modifying or deleting any existing scheduled runs.",
+      "actual_behavior": "Calls models.deployments._delete_scheduled_runs(..., auto_scheduled_only=True)."
+    },
+    {
+      "item": "average_flow_run_lateness",
+      "file": "src/prefect/server/api/flow_runs.py",
+      "bug_kind": "unit_mismatch",
+      "description_claim": "Query for average flow-run lateness in milliseconds.",
+      "actual_behavior": "Returns average lateness in seconds (total_seconds() and SQLite %s)."
+    },
+    {
+      "item": "count_flow_runs",
+      "file": "src/prefect/server/api/flow_runs.py",
+      "bug_kind": "unsupported_sort_claim",
+      "description_claim": "Query for flow runs. When sort is omitted, results default to ID_ASC.",
+      "actual_behavior": "count_flow_runs returns an integer count and does not accept or apply a sort parameter."
+    },
+    {
+      "item": "create_variable",
+      "file": "src/prefect/server/api/variables.py",
+      "bug_kind": "wrong_http_status",
+      "description_claim": "Duplicate variable names return HTTP 400.",
+      "actual_behavior": "Raises HTTPException with status_code=409."
+    }
+  ],
+  "audit_prompt": "In the codebase at `{target_path}`, audit every FastAPI route handler in `src/prefect/server/api/deployments.py`, `src/prefect/server/api/flow_runs.py`, and `src/prefect/server/api/variables.py`. For each endpoint, compare its docstring and parameter descriptions against its actual implementation (defaults, validation bounds, units, status codes, and side effects). Report any contradictions between what the docstring/description states and what the code actually does. Return JSON matching: `{\"contradictions\": [{\"tool\": \"...\", \"file_line\": \"...\", \"claim\": \"...\", \"actual\": \"...\"}]}`."
+}
