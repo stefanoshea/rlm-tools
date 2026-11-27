@@ -9,7 +9,10 @@ def is_private_component(name: str) -> bool:
     if name in {".env.example", ".env.sample", ".env.template"}:
         return False
     return (
-        name in {".git", ".env", ".mcp.local.json"}
+        name in {
+            ".git", ".env", ".mcp.local.json",
+            ".npmrc", ".pypirc", ".netrc", "settings.local.json",
+        }
         or name.startswith((".env.", ".mcpregistry_"))
     )
 

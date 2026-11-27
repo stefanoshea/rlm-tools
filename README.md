@@ -127,11 +127,11 @@ Three MCP tools. That's the entire API:
 
 The sandbox provides built-in helpers:
 
-- `read_file(path)` / `read_files(paths)` — Read files into variables (cached across calls)
+- `read_file(path, start_line=None, end_line=None)` / `read_files(paths)` — Read files or line slices into variables (cached across calls)
 - `grep(pattern)` / `grep_summary(pattern)` / `grep_read(pattern)` — Search
 - `glob_files(pattern)` — Find files by pattern
 - `tree(path, max_depth)` — Directory structure
-- `enclosing(path, line)` / `find_assignments(path, target)` — Python AST scope and assignment lookup
+- `outline(path)` / `enclosing(path, line)` / `find_assignments(path, target)` — Python AST outline, scope, and assignment lookup
 - `llm_query(prompt, context)` / `llm_query_batched(prompts, context)` — Sub-LLM analysis (optional, requires a provider key, `OPENAI_BASE_URL`, or `RLM_SUB_PROVIDER=claude-cli`)
 - `rlm_recurse(prompt, context)` / `rlm_recurse_batched(prompts, context)` — Ask a sub-agent to explore the session directory (optional, requires a provider key, `OPENAI_BASE_URL`, or `RLM_SUB_PROVIDER=claude-cli`)
 
@@ -273,10 +273,12 @@ A grant covers the named directory and its descendants. Keep private repositorie
 | `GEMINI_DECISION_MODEL` | `gemini-decision-1` | Gemini Decisions model used when `RLM_GATE_PROVIDER=gemini` (or `auto` with `GEMINI_API_KEY`). |
 | `RLM_RECURSE_GATE` | `0` | Set to `1` to enable evidence-gate scoring for external-enabled sessions. |
 | `RLM_SUB_MODEL` | `claude-haiku-4-5-20251001` / `gemini-3.5-flash-lite` / `gpt-4.1-mini` / `haiku` | Model used for `llm_query()` / `rlm_recurse()` (defaults by active provider). |
-| `RLM_CLI_MAX_CONCURRENCY` | `4` | Max concurrent `claude` subprocesses when `RLM_SUB_PROVIDER=claude-cli`. |
+| `RLM_CLI_MAX_CONCURRENCY` | `8` | Max concurrent `claude` subprocesses when `RLM_SUB_PROVIDER=claude-cli`. |
 | `RLM_SUB_TIMEOUT_SECONDS` | `60` | Per-request timeout for sub-LLM calls |
 | `RLM_SUB_MAX_RETRIES` | `3` | Retry attempts for transient sub-LLM failures |
 | `RLM_RECURSE_MAX_DEPTH` | `2` | Max recursion depth for `rlm_recurse()` child agents |
+| `RLM_CHILD_MAX_TOOL_CHARS` | `24000` | Max characters per individual tool result returned to an `rlm_recurse()` child |
+| `RLM_CHILD_MAX_TOTAL_TOOL_CHARS` | `96000` | Cumulative tool-result character budget per `rlm_recurse()` child run |
 | `RLM_MAX_SESSIONS` | `16` | Max concurrent sessions (idle sessions over `RLM_IDLE_EVICT_SECONDS` are LRU-evicted at the cap) |
 | `RLM_SESSION_TIMEOUT` | `10` | Session timeout in minutes |
 | `RLM_IDLE_EVICT_SECONDS` | `60` | Minimum idle seconds before an inactive session can be evicted at `RLM_MAX_SESSIONS` |
@@ -305,16 +307,16 @@ To power `llm_query()` and `rlm_recurse()` from an existing Claude Code subscrip
 
 - **Explicit opt-in only:** `RLM_SUB_PROVIDER=claude-cli` (aliases `claude_cli`, `claude-code`) is never selected in `auto` mode.
 - **No token extraction:** `rlm-tools` never reads or passes your OAuth token. Instead, it runs `claude -p` as a subprocess with `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, and nested-session variables (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SSE_PORT`) stripped from the child environment, inside a temporary working directory with tools disabled, an empty strict MCP config (`{"mcpServers":{}}`), `--setting-sources ""`, and `--safe-mode`.
-- **Latency & usage limits:** Each call starts a new `claude -p` process (~1–2 seconds of startup overhead per call), so it is slower than direct API calls and counts toward your Claude subscription usage limits. When running `llm_query_batched()` or `rlm_recurse()`, pass a higher `execution_timeout_seconds` (for example `120`–`180`) to `rlm_start()`, and adjust `RLM_CLI_MAX_CONCURRENCY` (default `4`) or `RLM_SUB_MODEL` (default `haiku`) as needed.
+- **Latency & usage limits:** Each call starts a new `claude -p` process (~1–2 seconds of startup overhead per call), so it is slower than direct API calls and counts toward your Claude subscription usage limits. When running `llm_query_batched()` or `rlm_recurse()`, `execution_timeout_seconds` defaults to `180` for `claude-cli`, and you can adjust `RLM_CLI_MAX_CONCURRENCY` (default `8`) or `RLM_SUB_MODEL` (default `haiku`) as needed.
 
 ## Security
 
 The stdio server is designed for one local MCP client. It starts each Python worker with an empty environment, a private IPC socket, and isolated Python startup. macOS uses Seatbelt. Linux requires `libseccomp.so.2` and permits the system calls needed for computation and the private socket. Worker startup fails if the OS or launcher cannot apply the policy, including hosts that forbid nested macOS sandboxing. The trusted parent holds repository descriptors and provider credentials.
 
-- A session can open only an operator-approved directory. Helpers open paths relative to a retained directory descriptor, skip symlinks and multiply linked files, and read regular files only. They exclude Git metadata, local MCP configuration, registry token files, and `.env` variants except `.env.example`, `.env.sample`, and `.env.template`. Other files within the root can be returned to the agent.
+- A session can open only an operator-approved directory. Helpers open paths relative to a retained directory descriptor, skip symlinks and multiply linked files, and read regular files only. They exclude Git metadata (`.git`), local MCP and agent config (`.mcp.local.json`, `settings.local.json`), registry/auth token files (`.npmrc`, `.pypirc`, `.netrc`, `.mcpregistry_*`), and `.env` variants except `.env.example`, `.env.sample`, and `.env.template` (committed `.mcp.json` files remain readable). Other files within the root can be returned to the agent.
 - Reads, batches, regex searches, directory scans, and IPC messages have size limits. A file read returns at most 4 MiB of source text plus a truncation marker. Grep uses RE2 syntax and a 1 MiB engine memory budget. For patterns that need Python lookaround or backreferences, apply the worker's `re` module to a bounded file read. Narrow the path or pattern when a search reports a limit. Metadata can include `truncated: true`.
 - Python imports expose selected public names from approved standard-library modules. Relative imports, private attributes, and wrapper helpers are restricted inside the OS-confined worker.
-- Workers enforce an execution timeout, restrict Python imports and builtins, and bound printed output. CPU and address-space backstops depend on OS support. Parent-side model requests use the remaining execution time for their network timeouts. An in-flight filesystem or network operation can still delay a response.
+- Workers enforce an execution timeout, restrict Python imports and builtins, and bound printed output. Per-session retained memory (default `64 MiB`) is enforced post-execution with variable eviction backstops, and Linux `RLIMIT_AS` caps runaway virtual allocations in flight (macOS ignores `RLIMIT_AS`). CPU and address-space backstops depend on OS support. Parent-side model requests use the remaining execution time for their network timeouts. An in-flight filesystem or network operation can still delay a response.
 - Model helpers are enabled per root. A local session never registers them, even when the server has provider credentials. Treat any root enabled for external processing as shareable with the selected providers.
 
 ## Background

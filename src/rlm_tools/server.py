@@ -164,7 +164,7 @@ def _rlm_start(
     query: str,
     max_output_chars: int = 15_000,
     max_llm_calls: int = 50,
-    max_execute_calls: int = 50,
+    max_execute_calls: int = 100,
     execution_timeout_seconds: int | None = None,
     include_guidance: bool = False,
     include_metadata: bool = False,
@@ -258,13 +258,14 @@ def _initialize_session(
     _sandboxes[session_id] = sandbox
 
     available_functions = [
-        "read_file(path, max_bytes_read=None) -> str",
+        "read_file(path, max_bytes_read=None, start_line=None, end_line=None) -> str",
         "read_files(paths, max_bytes_read=None) -> dict[path, content]",
-        "grep(pattern, path='.', max_matches=None, allow_partial=False) -> list[{file, line_number, line}] (raises on truncation unless allow_partial=True)",
+        "grep(pattern, path='.', max_matches=None, allow_partial=False) -> list[{file, line_number, line}] (raises on workspace truncation unless allow_partial=True; explicit max_matches caps count without error)",
         "grep_summary(pattern, path='.', max_matches=None) -> compact grouped str (starts with TRUNCATED if incomplete)",
         "grep_read(pattern, path='.', max_files=10, context_lines=0, max_matches=None, max_bytes_read=None) -> {matches, files, summary, truncated, limit_hit, files_scanned, files_skipped}",
         "glob_files(pattern) -> sorted list[str] (raises on truncation)",
         "tree(path='.', max_depth=3) -> str (starts with TRUNCATED if incomplete)",
+        "outline(path) -> {path, total_lines, classes, functions} (Python AST classes, methods, functions, decorators, fields, line spans)",
         "enclosing(path, line) -> {line, qualified, chain, spans}",
         "find_assignments(path, target) -> list[{line_number, kind, target, enclosing, line}]",
     ]
@@ -386,6 +387,11 @@ def _execute_session_data(
     }
     if result.final is not None:
         response["final"] = result.final
+    if result.error is None:
+        remaining_calls = session.max_execute_calls - session.execute_calls
+        warn_threshold = max(5, int(session.max_execute_calls * 0.15))
+        if 0 < remaining_calls <= warn_threshold:
+            response["budget_warning"] = f"{remaining_calls} execute calls remaining"
 
     if detail_level in {"usage", "full"}:
         response["usage"] = _usage_payload(session, result.memory_bytes_used)
@@ -397,7 +403,7 @@ def _execute_session_data(
             "read_file", "read_files",
             "grep", "grep_summary", "grep_read",
             "glob_files", "tree",
-            "enclosing", "find_assignments",
+            "outline", "enclosing", "find_assignments",
             "llm_query", "llm_query_batched",
             "rlm_recurse", "rlm_recurse_batched",
             "rlm_finalize",
@@ -438,10 +444,15 @@ def _execute_session(
 
 def _rlm_end(session_id: str) -> str:
     _cleanup_expired_resources()
+    usage = None
     with session_manager.use(session_id) as session:
         if session is not None:
+            usage = _usage_payload(session, session.memory_bytes_used)
             _close_session(session_id)
-    return json.dumps({"success": True})
+    payload: dict = {"success": True}
+    if usage is not None:
+        payload["usage"] = usage
+    return json.dumps(payload)
 
 
 async def _run_session_operation(operation, session_id: str, *args) -> str:
@@ -462,7 +473,7 @@ async def rlm_start(
     query: Annotated[str, Field(description="What you want to find or analyze")],
     max_output_chars: Annotated[int, Field(description="Max characters per execute output", ge=100, le=100_000)] = 15_000,
     max_llm_calls: Annotated[int, Field(description="Maximum model calls (llm_query, rlm_recurse, and evidence gate) for this session", ge=1, le=10_000)] = 50,
-    max_execute_calls: Annotated[int, Field(description="Maximum rlm_execute calls for this session", ge=1, le=10_000)] = 50,
+    max_execute_calls: Annotated[int, Field(description="Maximum rlm_execute calls for this session", ge=1, le=10_000)] = 100,
     execution_timeout_seconds: Annotated[int | None, Field(description="Per-rlm_execute timeout in seconds (defaults to 30 local, 60 external API, 180 claude-cli)", ge=1, le=600)] = None,
     include_guidance: Annotated[bool, Field(description="Include strategy/example guidance text in the response (larger payload)")] = False,
     include_metadata: Annotated[bool, Field(description="Scan directory and include file counts/types in response (default false for faster startup)")] = False,
@@ -485,9 +496,10 @@ async def rlm_execute(
     session_id: Annotated[str, Field(description="Session ID from rlm_start")],
     code: Annotated[str, Field(description=(
         "Python code to execute in the persistent sandbox (variables persist across calls). "
-        "Built-in helpers: read_file(path), read_files(paths), grep(pattern, path='.', allow_partial=False), "
+        "Built-in helpers: read_file(path, max_bytes_read=None, start_line=None, end_line=None), read_files(paths), "
+        "grep(pattern, path='.', max_matches=None, allow_partial=False), "
         "grep_summary(pattern, path='.'), grep_read(pattern, path='.', max_files=10, context_lines=0, max_matches=None, max_bytes_read=None), "
-        "glob_files(pattern), tree(path='.', max_depth=3), enclosing(path, line), "
+        "glob_files(pattern), tree(path='.', max_depth=3), outline(path), enclosing(path, line), "
         "find_assignments(path, target), rlm_finalize(value). "
         "Allowed imports ONLY: re, json, collections, math, fnmatch, itertools, functools, "
         "operator, string, textwrap, difflib, statistics. "

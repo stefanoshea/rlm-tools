@@ -300,7 +300,7 @@ def test_new_defaults():
 
         result = _rlm_start(path=tmpdir, query="test defaults")
         data = json.loads(result)
-        assert data["limits"]["max_execute_calls"] == 50
+        assert data["limits"]["max_execute_calls"] == 100
         assert data["limits"]["execution_timeout_seconds"] == 30
         assert data["limits"]["max_memory_bytes"] == 64 * 1024 * 1024
         assert data["limits"]["max_scan_bytes"] == 256 * 1024 * 1024
@@ -655,6 +655,7 @@ def test_dynamic_execution_timeout_defaults(external_test_roots, tmp_path, monke
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setenv("RLM_SUB_PROVIDER", "claude-cli")
     monkeypatch.setattr(llm_bridge.shutil, "which", lambda name: "/usr/bin/claude")
+    monkeypatch.setattr(llm_bridge, "get_client", lambda *a, **kw: llm_bridge._ClaudeCLIClient())
     cli_start = json.loads(server_module._rlm_start(str(tmp_path), "cli timeout"))
     try:
         assert cli_start["limits"]["execution_timeout_seconds"] == 180
@@ -704,6 +705,7 @@ def test_grep_read_signature_policy_block_and_skill_docs_stay_in_sync(tmp_path):
         _rlm_end(started["session_id"])
 
     policy = setup_cli.render_policy_block()
+    assert "`outline`" in policy
     assert "`enclosing`" in policy
     assert "`find_assignments`" in policy
 
@@ -711,3 +713,60 @@ def test_grep_read_signature_policy_block_and_skill_docs_stay_in_sync(tmp_path):
     skill_a = (repo_root / "skills" / "rlm-explore" / "SKILL.md").read_bytes()
     skill_b = (repo_root / "plugins" / "rlm-tools" / "skills" / "rlm-explore" / "SKILL.md").read_bytes()
     assert skill_a == skill_b
+
+
+def test_rlm_end_returns_usage_and_budget_warning_and_outline_in_sandbox(external_test_roots, tmp_path, monkeypatch):
+    import rlm_tools.llm_bridge as llm_bridge
+    import rlm_tools.server as server_module
+
+    monkeypatch.setenv("RLM_SUB_PROVIDER", "claude-cli")
+    monkeypatch.setattr(llm_bridge.shutil, "which", lambda name: "/usr/bin/claude")
+    monkeypatch.setattr(llm_bridge, "get_client", lambda *a, **kw: llm_bridge._ClaudeCLIClient())
+    cli_reply = json.dumps({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "ok",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+        "total_cost_usd": 0.001,
+    })
+    monkeypatch.setattr(llm_bridge.subprocess, "run", lambda cmd, **kw: type("P", (), {
+        "stdout": cli_reply, "stderr": "", "returncode": 0
+    })())
+
+    (tmp_path / "mod.py").write_text(
+        "class Svc:\n"
+        "    flag: bool = True\n"
+        "    def run(\n"
+        "        self,\n"
+        "        x: int,\n"
+        "    ) -> int:\n"
+        "        return x\n"
+    )
+    started = json.loads(server_module._rlm_start(str(tmp_path), "outline & end usage", max_execute_calls=2))
+    sid = started["session_id"]
+    try:
+        funcs = " ".join(started["available_functions"])
+        assert "outline(path)" in funcs
+        assert "start_line=None, end_line=None" in funcs
+        assert "explicit max_matches caps count without error" in funcs
+
+        out1 = json.loads(server_module._rlm_execute(
+            sid,
+            "import json\n"
+            "o = outline('mod.py')\n"
+            "s = read_file('mod.py', start_line=3, end_line=7)\n"
+            "q = llm_query('hi')\n"
+            "print(json.dumps({'methods': len(o['classes'][0]['methods']), 'slice_lines': len(s.splitlines())}))",
+            detail_level="full",
+        ))
+        assert out1["error"] is None
+        assert json.loads(out1["stdout"]) == {"methods": 1, "slice_lines": 5}
+        assert "outline" not in out1["variables"]
+        assert out1["budget_warning"] == "1 execute calls remaining"
+    finally:
+        ended = json.loads(server_module._rlm_end(sid))
+
+    assert ended["success"] is True
+    assert ended["usage"]["execute_calls_used"] == 1
+    assert ended["usage"]["sub_llm_usage"]["total_cost_usd"] == pytest.approx(0.001)

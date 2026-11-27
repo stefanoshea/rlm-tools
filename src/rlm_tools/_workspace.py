@@ -299,6 +299,8 @@ class ScanBudget:
     limit_hit: str | None = None
     files_scanned: int = 0
     files_skipped: int = 0
+    oversized_files: list[str] = field(default_factory=list)
+    oversized_count: int = 0
     max_bytes: int = field(init=False)
     max_entries: int = field(init=False)
     max_seconds: float = field(init=False)
@@ -319,6 +321,11 @@ class ScanBudget:
         self.truncated = True
         if self.limit_hit is None:
             self.limit_hit = reason
+
+    def record_oversized(self, path: str, size_bytes: int) -> None:
+        self.oversized_count += 1
+        if len(self.oversized_files) < 5:
+            self.oversized_files.append(f"{path} ({size_bytes / (1024 * 1024):.2f} MiB)")
 
     def has_time(self) -> bool:
         if time.monotonic() >= self.deadline:
@@ -350,7 +357,16 @@ class ScanBudget:
         elif reason == "result_bytes":
             detail = "result size limit"
         elif reason == "file_bytes":
-            detail = "file read size limit"
+            if self.oversized_files:
+                names = ", ".join(self.oversized_files)
+                extra = (
+                    f" (+{self.oversized_count - len(self.oversized_files)} more)"
+                    if self.oversized_count > len(self.oversized_files)
+                    else ""
+                )
+                detail = f"file read size limit: {self.oversized_count} file(s) exceeded 4 MiB — {names}{extra}"
+            else:
+                detail = "file read size limit"
         elif reason == "path_depth":
             detail = f"{MAX_PATH_DEPTH}-level path depth limit"
         else:
@@ -362,7 +378,7 @@ class ScanBudget:
             progress = f"after {visited:,} entries visited"
         return (
             f"TRUNCATED ({detail}; scan truncated {progress}"
-            " — narrow path=, max_depth=, or pattern to complete)"
+            " — pass allow_partial=True or narrow path=, max_depth=, or pattern to complete)"
         )
 
 
@@ -398,7 +414,7 @@ class Workspace:
         self._close_lock = threading.Lock()
         self._finalize = finalize(self, os.close, root_fd)
         self._dir_cache: collections.OrderedDict[
-            tuple[tuple[str, ...], bool],
+            tuple[tuple[str, ...], bool, bool],
             tuple[
                 tuple[int, int, int, int],
                 tuple[int, int, int, int, int] | None,
@@ -559,6 +575,7 @@ class Workspace:
         budget: ScanBudget,
         *,
         include_hidden: bool = False,
+        include_hidden_dirs: bool = False,
         respect_gitignore: bool = True,
         ancestor_layers: tuple[tuple[tuple[str, ...], tuple[_GitIgnoreRule, ...]], ...] = (),
     ) -> tuple[list[tuple[bool, str]], tuple[tuple[tuple[str, ...], tuple[_GitIgnoreRule, ...]], ...]]:
@@ -569,7 +586,7 @@ class Workspace:
         except OSError:
             return [], ancestor_layers
         gi_sig = self._dir_gitignore_sig(fd) if respect_gitignore else None
-        cache_key = (relative.parts, include_hidden)
+        cache_key = (relative.parts, include_hidden, include_hidden_dirs)
 
         cached_raw: list[tuple[bool, str]] | None = None
         local_rules: tuple[_GitIgnoreRule, ...] = ()
@@ -595,7 +612,7 @@ class Workspace:
                             continue
                         try:
                             if entry.is_dir(follow_symlinks=False):
-                                if entry.name in _SKIP_DIRS or entry.name.startswith("."):
+                                if entry.name in _SKIP_DIRS or (entry.name.startswith(".") and not include_hidden_dirs):
                                     continue
                                 raw.append((True, entry.name))
                             elif entry.is_file(follow_symlinks=False):
@@ -646,6 +663,7 @@ class Workspace:
         budget,
         *,
         include_hidden=False,
+        include_hidden_dirs: bool = False,
         select_directory=None,
         respect_gitignore: bool = True,
         _ancestor_layers=None,
@@ -666,6 +684,7 @@ class Workspace:
             relative,
             budget,
             include_hidden=include_hidden,
+            include_hidden_dirs=include_hidden_dirs,
             respect_gitignore=respect_gitignore,
             ancestor_layers=_ancestor_layers,
         )
@@ -683,6 +702,7 @@ class Workspace:
                             path,
                             budget,
                             include_hidden=include_hidden,
+                            include_hidden_dirs=include_hidden_dirs,
                             select_directory=select_directory,
                             respect_gitignore=respect_gitignore,
                             _ancestor_layers=layers,

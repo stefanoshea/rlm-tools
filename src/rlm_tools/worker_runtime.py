@@ -88,16 +88,46 @@ class _OutputCapture(io.StringIO):
         super().__init__()
         self._limit = max(0, limit)
         self.truncated = False
+        self.total_chars = 0
+        self._completed_total_lines = 0
+        self._total_in_line = False
+        self._completed_kept_lines = 0
+        self._kept_in_line = False
 
     def write(self, text: str) -> int:
+        if not text:
+            return 0
+        self.total_chars += len(text)
+        nl_count = text.count("\n")
+        if nl_count:
+            self._completed_total_lines += nl_count
+            self._total_in_line = not text.endswith("\n")
+        else:
+            self._total_in_line = True
+
         remaining = self._limit - self.tell()
         if len(text) > remaining:
             self.truncated = True
-            text_to_keep = text[:remaining]
+            text_to_keep = text[:max(0, remaining)]
         else:
             text_to_keep = text
+        if text_to_keep:
+            kept_nl = text_to_keep.count("\n")
+            if kept_nl:
+                self._completed_kept_lines += kept_nl
+                self._kept_in_line = not text_to_keep.endswith("\n")
+            else:
+                self._kept_in_line = True
         super().write(text_to_keep)
         return len(text)
+
+    @property
+    def total_lines(self) -> int:
+        return self._completed_total_lines + (1 if self._total_in_line else 0)
+
+    @property
+    def kept_lines(self) -> int:
+        return self._completed_kept_lines + (1 if self._kept_in_line else 0)
 
 
 def apply_resource_limits(
@@ -344,7 +374,10 @@ class WorkerRuntime:
 
         stdout = stdout_capture.getvalue()
         if stdout_capture.truncated:
-            stdout += "\n... [output truncated]"
+            stdout += (
+                f"\n... [output truncated] ({len(stdout)}/{stdout_capture.total_chars} chars, "
+                f"{stdout_capture.kept_lines}/{stdout_capture.total_lines} lines)"
+            )
 
         memory_bytes_used = self._measure_user_memory(limit=self._max_memory_bytes)
         if memory_bytes_used > self._max_memory_bytes:

@@ -788,3 +788,140 @@ def test_exact_scan_byte_limit_and_lru_file_cache_and_tree_truncation_banner(tmp
     assert tracked["bytes"] == 10
     assert lru_helpers["read_file"]("b.txt") == "b" * 10
     assert tracked["bytes"] == 10
+
+
+def test_private_config_files_blocked_while_committed_mcp_json_readable(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / ".npmrc").write_text("//registry.npmjs.org/:_authToken=secret\n")
+    (tmp_path / ".pypirc").write_text("[pypi]\npassword = secret\n")
+    (tmp_path / ".netrc").write_text("machine example.com password secret\n")
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.local.json").write_text('{"env":{"SECRET":"1"}}\n')
+    (tmp_path / ".mcp.json").write_text('{"mcpServers":{}}\n')
+
+    helpers, _ = make_helpers(str(tmp_path))
+    for private_path in ("sub/.npmrc", ".pypirc", ".netrc", ".claude/settings.local.json"):
+        with pytest.raises(PermissionError, match="private"):
+            helpers["read_file"](private_path)
+    assert helpers["grep"]("secret") == []
+    assert ".mcp.json" in helpers["glob_files"]("*")
+    assert '"mcpServers"' in helpers["read_file"](".mcp.json")
+    assert "settings.local.json" not in helpers["glob_files"](".claude/*")
+
+
+def test_glob_files_supports_explicit_dot_folders_and_trailing_globstar(tmp_path):
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    (tmp_path / ".github" / "workflows" / "test.yml").write_text("name: test\n")
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.json").write_text("{}\n")
+    (tmp_path / ".x" / "nested").mkdir(parents=True)
+    (tmp_path / ".x" / "nested" / "file.txt").write_text("hi\n")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("[core]\n")
+    (tmp_path / ".vscode").mkdir()
+    (tmp_path / ".vscode" / "ignored.py").write_text("x = 1\n")
+    (tmp_path / "main.py").write_text("x = 1\n")
+
+    helpers, _ = make_helpers(str(tmp_path))
+    assert helpers["glob_files"](".github/workflows/*.yml") == [".github/workflows/test.yml"]
+    assert helpers["glob_files"](".claude/*") == [".claude/settings.json"]
+    assert helpers["glob_files"](".x/**") == [".x/nested/file.txt"]
+    assert helpers["glob_files"]("**/*.py") == ["main.py"]
+    assert helpers["glob_files"](".git/*") == []
+
+
+def test_oversized_file_truncation_names_exact_file(tmp_path, monkeypatch):
+    from rlm_tools import helpers as helper_module
+
+    monkeypatch.setattr(helper_module, "MAX_FILE_BYTES", 50)
+    (tmp_path / "small.py").write_text("hit = 1\n")
+    (tmp_path / "huge.py").write_text("x" * 120)
+
+    helpers, _ = make_helpers(str(tmp_path))
+    with pytest.raises(RuntimeError, match="huge\\.py"):
+        helpers["grep"]("hit")
+
+    summary = helpers["grep_summary"]("hit")
+    assert summary.startswith("TRUNCATED (")
+    assert "huge.py" in summary
+    assert "exceeded 4 MiB" in summary
+
+    res = helpers["grep_read"]("hit")
+    assert res["truncated"] is True
+    assert res["limit_hit"] == "file_bytes"
+    assert any("huge.py" in item for item in res["oversized_files"])
+
+
+def test_read_file_line_slicing_and_validation(tmp_path):
+    (tmp_path / "lines.py").write_text("l1\nl2\nl3\nl4\nl5\n", encoding="utf-8")
+    helpers, _ = make_helpers(str(tmp_path))
+
+    assert helpers["read_file"]("lines.py", start_line=2, end_line=4) == "l2\nl3\nl4"
+    assert helpers["read_file"]("lines.py", start_line=4) == "l4\nl5"
+    assert helpers["read_file"]("lines.py", end_line=2) == "l1\nl2"
+
+    with pytest.raises(ValueError, match="start_line"):
+        helpers["read_file"]("lines.py", start_line=0)
+    with pytest.raises(ValueError, match="end_line"):
+        helpers["read_file"]("lines.py", start_line=4, end_line=2)
+
+
+def test_outline_extracts_classes_fields_decorators_and_multiline_defs(tmp_path):
+    src = (
+        "@tool(name='search', readonly=True)\n"
+        "async def multi_line_fn(\n"
+        "    a: int,\n"
+        "    b: str,\n"
+        ") -> None:\n"
+        "    def inner():\n"
+        "        return 1\n"
+        "    return None\n"
+        "\n"
+        "@dataclass\n"
+        "class Widget(BaseWidget):\n"
+        "    title: str\n"
+        "    count: int = 0\n"
+        "    def __init__(self, extra: int):\n"
+        "        self.extra = extra\n"
+        "        self.items: list[str] = []\n"
+        "    def render(\n"
+        "        self,\n"
+        "    ) -> str:\n"
+        "        return self.title\n"
+    )
+    (tmp_path / "mod.py").write_text(src, encoding="utf-8")
+    # Deeply nested expression inside decorator must not raise RecursionError.
+    (tmp_path / "deep_dec.py").write_text(
+        "@dec(" + " + ".join(["1"] * 1200) + ")\n"
+        "def f():\n"
+        "    return 1\n",
+        encoding="utf-8",
+    )
+
+    helpers, _ = make_helpers(str(tmp_path))
+    out = helpers["outline"]("mod.py")
+    assert out["path"] == "mod.py"
+    assert out["total_lines"] == 20
+    assert [f["qualified"] for f in out["functions"]] == ["multi_line_fn", "multi_line_fn.inner"]
+    top_fn = out["functions"][0]
+    assert top_fn["kind"] == "async_function"
+    assert top_fn["decorator_line"] == 1
+    assert top_fn["start_line"] == 2
+    assert top_fn["end_line"] == 8
+    assert top_fn["lines"] == 7
+    assert top_fn["decorators"][0]["name"] == "tool"
+    assert top_fn["decorators"][0]["kwargs"] == {"name": "'search'", "readonly": "True"}
+
+    assert len(out["classes"]) == 1
+    cls = out["classes"][0]
+    assert cls["name"] == "Widget"
+    assert cls["bases"] == ["BaseWidget"]
+    assert cls["decorators"] == [{"name": "dataclass"}]
+    assert cls["fields"] == ["title", "count"]
+    assert cls["field_count"] == 2
+    assert cls["init_attributes"] == ["extra", "items"]
+    assert [m["name"] for m in cls["methods"]] == ["__init__", "render"]
+    assert cls["methods"][1]["lines"] == 4
+
+    deep_out = helpers["outline"]("deep_dec.py")
+    assert deep_out["functions"][0]["name"] == "f"

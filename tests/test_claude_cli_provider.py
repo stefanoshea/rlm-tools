@@ -655,3 +655,20 @@ def test_recurse_penultimate_empty_requests_synthesizes_without_conflicting_inst
     assert rq("question") == "Final synthesized answer"
     assert len(prompts) == 2
     assert "Either provide 1-4" not in prompts[1]
+
+
+def test_default_cli_concurrency_is_8_and_batched_honors_env(monkeypatch):
+    assert llm_bridge.DEFAULT_CLI_MAX_CONCURRENCY == 8
+    monkeypatch.setenv("RLM_CLI_MAX_CONCURRENCY", "10")
+    recorded = {}
+    real_pool = llm_bridge.ThreadPoolExecutor
+
+    class SpyPool(real_pool):
+        def __init__(self, max_workers=None, *args, **kwargs):
+            recorded["max_workers"] = max_workers
+            super().__init__(max_workers=max_workers, *args, **kwargs)
+
+    monkeypatch.setattr(llm_bridge, "ThreadPoolExecutor", SpyPool)
+    batched = make_llm_query_batched(lambda p, c="": p)
+    assert batched(["a", "b"]) == ["a", "b"]
+    assert recorded["max_workers"] == 10

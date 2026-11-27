@@ -473,3 +473,75 @@ def test_openai_recurse_loop_depth_gate_malformed_args_and_extra_content():
         assert "expected JSON object" in loop_reqs[1]["messages"][-1]["content"]
     finally:
         loop_client.close()
+
+
+def test_recurse_exposes_ast_helpers_caps_tool_output_and_caches_anthropic_prefix():
+    helpers = {
+        "grep_summary": MagicMock(return_value="ok"),
+        "read_file": MagicMock(return_value="Z" * 120),
+        "glob_files": MagicMock(return_value=["a.py"]),
+        "tree": MagicMock(return_value="."),
+        "outline": MagicMock(return_value={"classes": [], "functions": []}),
+        "enclosing": MagicMock(return_value={"qualified": "foo"}),
+        "find_assignments": MagicMock(return_value=[]),
+        "grep_read": MagicMock(return_value={"summary": "1 match"}),
+    }
+    captured_requests = []
+
+    class FakeAnthropic:
+        class messages:
+            @staticmethod
+            def create(**kwargs):
+                # Snapshot mutable message list at call time.
+                captured_requests.append(json.loads(json.dumps({
+                    "tools": kwargs["tools"],
+                    "messages": [
+                        m if not isinstance(m.get("content"), list) else {
+                            "role": m["role"],
+                            "content": [
+                                b if isinstance(b, dict) else {"type": b.type, "id": b.id, "name": b.name}
+                                for b in m["content"]
+                            ],
+                        }
+                        for m in kwargs["messages"]
+                    ],
+                })))
+                idx = len(captured_requests)
+                if idx == 1:
+                    return _Resp([_Block("tool_use", name="read_file", input={"path": "a.py"}, id="t1")], "tool_use")
+                if idx == 2:
+                    return _Resp([_Block("tool_use", name="read_file", input={"path": "b.py"}, id="t2")], "tool_use")
+                return _Resp([_Block("text", text="done")], "end_turn")
+
+    import os
+    old_single = os.environ.get("RLM_CHILD_MAX_TOOL_CHARS")
+    old_total = os.environ.get("RLM_CHILD_MAX_TOTAL_TOOL_CHARS")
+    os.environ["RLM_CHILD_MAX_TOOL_CHARS"] = "40"
+    os.environ["RLM_CHILD_MAX_TOTAL_TOOL_CHARS"] = "180"
+    try:
+        recurse = make_recursive_query(client=FakeAnthropic(), helpers=helpers, model="m", max_depth=0)
+        assert recurse("check") == "done"
+    finally:
+        if old_single is None:
+            os.environ.pop("RLM_CHILD_MAX_TOOL_CHARS", None)
+        else:
+            os.environ["RLM_CHILD_MAX_TOOL_CHARS"] = old_single
+        if old_total is None:
+            os.environ.pop("RLM_CHILD_MAX_TOTAL_TOOL_CHARS", None)
+        else:
+            os.environ["RLM_CHILD_MAX_TOTAL_TOOL_CHARS"] = old_total
+
+    tool_names = {t["name"] for t in captured_requests[0]["tools"]}
+    assert {"outline", "enclosing", "find_assignments", "grep_read"} <= tool_names
+    assert captured_requests[0]["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+
+    # Turn 2 has cache_control on t1 result; Turn 3 moves cache_control from t1 to t2.
+    t1_turn2 = captured_requests[1]["messages"][-1]["content"][0]
+    assert t1_turn2["cache_control"] == {"type": "ephemeral"}
+    assert "showed 40 of 120 chars" in t1_turn2["content"]
+
+    t1_turn3 = captured_requests[2]["messages"][2]["content"][0]
+    t2_turn3 = captured_requests[2]["messages"][4]["content"][0]
+    assert "cache_control" not in t1_turn3
+    assert t2_turn3["cache_control"] == {"type": "ephemeral"}
+    assert "tool output budget reached" in t2_turn3["content"]

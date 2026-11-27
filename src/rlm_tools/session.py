@@ -31,7 +31,7 @@ class Session:
     max_output_chars: int = 15_000
     max_llm_calls: int = 50
     llm_calls_used: int = 0
-    max_execute_calls: int = 50
+    max_execute_calls: int = 100
     execute_calls: int = 0
     memory_bytes_used: int = 0
     max_memory_bytes: int = field(default_factory=default_max_memory_bytes)
@@ -62,7 +62,7 @@ class SessionManager:
         query: str,
         max_output_chars: int = 15_000,
         max_llm_calls: int = 50,
-        max_execute_calls: int = 50,
+        max_execute_calls: int = 100,
         max_memory_bytes: int | None = None,
         *,
         pin: bool = False,

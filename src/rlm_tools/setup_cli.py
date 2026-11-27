@@ -78,7 +78,7 @@ def render_policy_block() -> str:
         "building on persistent variables, and pass `end_session=true` on your final "
         "`rlm_execute` (or finish with `rlm_end(session_id)`).\n"
         "3. Follow sandbox rules: use built-in helpers (`read_file`, `read_files`, `grep`, "
-        "`grep_summary`, `grep_read`, `glob_files`, `tree`, `enclosing`, `find_assignments`) "
+        "`grep_summary`, `grep_read`, `glob_files`, `tree`, `outline`, `enclosing`, `find_assignments`) "
         "and f-strings — do not import "
         "`os`, `glob`, `pathlib`, or `ast`, and do not call `open()`, `exec()`, `eval()`, "
         "`getattr()`, `dir()`, `type()`, or `.format()`.\n"

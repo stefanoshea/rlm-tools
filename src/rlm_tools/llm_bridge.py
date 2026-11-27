@@ -26,7 +26,9 @@ DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_CLAUDE_CLI_MODEL = "haiku"
-DEFAULT_CLI_MAX_CONCURRENCY = 4
+DEFAULT_CLI_MAX_CONCURRENCY = 8
+DEFAULT_CHILD_MAX_TOOL_CHARS = 24_000
+DEFAULT_CHILD_MAX_TOTAL_TOOL_CHARS = 96_000
 _CLI_ERROR_LIMIT = 400
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_MAX_RETRIES = 3
@@ -303,8 +305,14 @@ _cli_sem: threading.BoundedSemaphore | None = None
 _cli_semaphores_lock = threading.Lock()
 
 
-def _cli_recurse_schema(allow_recurse: bool) -> str:
-    ops = [spec["name"] for spec in _explore_tool_specs(allow_recurse=allow_recurse)]
+def _cli_recurse_schema(
+    allow_recurse: bool,
+    available_helpers: set[str] | None = None,
+) -> str:
+    ops = [
+        spec["name"]
+        for spec in _explore_tool_specs(allow_recurse=allow_recurse, available_helpers=available_helpers)
+    ]
     return json.dumps(
         {
             "type": "object",
@@ -811,7 +819,21 @@ def make_llm_query(
     return llm_query
 
 
-def _explore_tool_specs(allow_recurse: bool) -> list[dict]:
+def _child_tool_char_limit(env_name: str, default: int) -> int:
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _explore_tool_specs(
+    allow_recurse: bool,
+    available_helpers: set[str] | None = None,
+) -> list[dict]:
     specs = [
         {
             "name": "grep_summary",
@@ -827,10 +849,17 @@ def _explore_tool_specs(allow_recurse: bool) -> list[dict]:
         },
         {
             "name": "read_file",
-            "description": "Read a single file's contents by path, relative to the corpus root.",
+            "description": (
+                "Read a file or a 1-based line slice by path, relative to the corpus root. "
+                "Prefer passing start_line/end_line on large files instead of reading the whole file."
+            ),
             "input_schema": {
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer", "description": "Optional 1-based start line"},
+                    "end_line": {"type": "integer", "description": "Optional 1-based inclusive end line"},
+                },
                 "required": ["path"],
             },
         },
@@ -855,6 +884,61 @@ def _explore_tool_specs(allow_recurse: bool) -> list[dict]:
             },
         },
     ]
+    optional_specs = [
+        {
+            "name": "outline",
+            "description": (
+                "Return Python AST outline (classes, methods, functions, decorators, fields, and exact line spans) "
+                "for a .py file."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "enclosing",
+            "description": "Return the enclosing class/function chain for a 1-based line in a Python file.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "line": {"type": "integer"},
+                },
+                "required": ["path", "line"],
+            },
+        },
+        {
+            "name": "find_assignments",
+            "description": "Find assignment sites (Assign, AnnAssign, AugAssign, NamedExpr) for a target in a Python file.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "target": {"type": "string"},
+                },
+                "required": ["path", "target"],
+            },
+        },
+        {
+            "name": "grep_read",
+            "description": "Search for a pattern and return grouped matches plus bounded excerpts with context lines.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string", "description": "Directory or file to search (default '.')"},
+                    "max_files": {"type": "integer", "description": "Max matching files to excerpt (default 5)"},
+                    "context_lines": {"type": "integer", "description": "Context lines around each match (default 2)"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    ]
+    for spec in optional_specs:
+        if available_helpers is None or spec["name"] in available_helpers:
+            specs.append(spec)
     if allow_recurse:
         specs.append({
             "name": "recurse",
@@ -872,7 +956,10 @@ def _explore_tool_specs(allow_recurse: bool) -> list[dict]:
     return specs
 
 
-def _gemini_explore_tool_specs(allow_recurse: bool) -> list[dict]:
+def _gemini_explore_tool_specs(
+    allow_recurse: bool,
+    available_helpers: set[str] | None = None,
+) -> list[dict]:
     return [
         {
             "type": "function",
@@ -880,11 +967,14 @@ def _gemini_explore_tool_specs(allow_recurse: bool) -> list[dict]:
             "description": spec["description"],
             "parameters": spec["input_schema"],
         }
-        for spec in _explore_tool_specs(allow_recurse)
+        for spec in _explore_tool_specs(allow_recurse, available_helpers=available_helpers)
     ]
 
 
-def _openai_explore_tool_specs(allow_recurse: bool) -> list[dict]:
+def _openai_explore_tool_specs(
+    allow_recurse: bool,
+    available_helpers: set[str] | None = None,
+) -> list[dict]:
     return [
         {
             "type": "function",
@@ -894,7 +984,7 @@ def _openai_explore_tool_specs(allow_recurse: bool) -> list[dict]:
                 "parameters": spec["input_schema"],
             },
         }
-        for spec in _explore_tool_specs(allow_recurse)
+        for spec in _explore_tool_specs(allow_recurse, available_helpers=available_helpers)
     ]
 
 
@@ -928,6 +1018,11 @@ def make_recursive_query(
     _client = client if client is not None else (get_client() if provider is None else get_client(provider))
     _provider = resolve_provider(provider, _client)
     _helpers = helpers or {}
+    _available_helpers = set(_helpers) if _helpers else None
+    _max_tool_chars = _child_tool_char_limit("RLM_CHILD_MAX_TOOL_CHARS", DEFAULT_CHILD_MAX_TOOL_CHARS)
+    _max_total_tool_chars = _child_tool_char_limit(
+        "RLM_CHILD_MAX_TOTAL_TOOL_CHARS", DEFAULT_CHILD_MAX_TOTAL_TOOL_CHARS
+    )
     default_model = _DEFAULT_MODELS[_provider]
     _model = model or os.environ.get("RLM_SUB_MODEL") or default_model
     _timeout = (
@@ -978,19 +1073,48 @@ def make_recursive_query(
             return f"[error: {type(e).__name__}: {e}]"
 
     def _execute_tool_call(
-        name: str, args: dict, depth: int, allowed_tools: set[str], prompt: str
+        name: str,
+        args: dict,
+        depth: int,
+        allowed_tools: set[str],
+        prompt: str,
+        tool_budget: dict[str, int],
     ) -> str:
         if name not in allowed_tools:
             return f"[error: unknown tool '{name}']"
         result = _run_tool(name, args, depth)
-        if gate is not None and name != "recurse":
+        if name == "recurse":
+            return result
+        if gate is not None:
             result = gate(prompt, result)
+        if len(result) > _max_tool_chars:
+            orig_len = len(result)
+            result = (
+                result[:_max_tool_chars]
+                + f"\n... [truncated: showed {_max_tool_chars:,} of {orig_len:,} chars — "
+                "use read_file(path, start_line=..., end_line=...) or outline(path)]"
+            )
+        rem = tool_budget["remaining"]
+        if rem <= 0:
+            return "[tool output budget reached — synthesize your answer from previous results]"
+        if len(result) > rem:
+            orig_len = len(result)
+            result = (
+                result[:rem]
+                + f"\n... [child tool output budget reached ({orig_len:,} chars); synthesize now]"
+            )
+            tool_budget["remaining"] = 0
+        else:
+            tool_budget["remaining"] = rem - len(result)
         return result
 
-    def _run_anthropic(prompt: str, content: str, depth: int) -> str:
-        tools = _explore_tool_specs(allow_recurse=depth > 0)
+    def _run_anthropic(prompt: str, content: str, depth: int, tool_budget: dict[str, int]) -> str:
+        tools = _explore_tool_specs(allow_recurse=depth > 0, available_helpers=_available_helpers)
+        cached_tools = [dict(spec) for spec in tools]
+        if cached_tools:
+            cached_tools[-1]["cache_control"] = {"type": "ephemeral"}
         allowed_tools = {spec["name"] for spec in tools}
-        messages = [{"role": "user", "content": content}]
+        messages: list[dict[str, Any]] = [{"role": "user", "content": content}]
 
         last_text = ""
         for iteration in range(max_iterations):
@@ -999,7 +1123,7 @@ def make_recursive_query(
                     model=_model,
                     max_tokens=2048,
                     messages=messages,
-                    tools=tools,
+                    tools=cached_tools,
                     timeout=timeout,
                 )
 
@@ -1018,6 +1142,11 @@ def make_recursive_query(
                 return last_text
 
             messages.append({"role": "assistant", "content": response.content})
+            for prev_msg in messages:
+                if prev_msg.get("role") == "user" and isinstance(prev_msg.get("content"), list):
+                    for blk in prev_msg["content"]:
+                        if isinstance(blk, dict):
+                            blk.pop("cache_control", None)
             tool_results = [
                 {
                     "type": "tool_result",
@@ -1028,16 +1157,19 @@ def make_recursive_query(
                         depth,
                         allowed_tools,
                         prompt,
+                        tool_budget,
                     ),
                 }
                 for block in tool_uses
             ]
+            if tool_results:
+                tool_results[-1]["cache_control"] = {"type": "ephemeral"}
             messages.append({"role": "user", "content": tool_results})
 
         return last_text
 
-    def _run_gemini(prompt: str, content: str, depth: int) -> str:
-        tools = _gemini_explore_tool_specs(allow_recurse=depth > 0)
+    def _run_gemini(prompt: str, content: str, depth: int, tool_budget: dict[str, int]) -> str:
+        tools = _gemini_explore_tool_specs(allow_recurse=depth > 0, available_helpers=_available_helpers)
         allowed_tools = {spec["name"] for spec in tools}
         previous_id: str | None = None
         next_input: Any = content
@@ -1085,6 +1217,7 @@ def make_recursive_query(
                                 depth,
                                 allowed_tools,
                                 prompt,
+                                tool_budget,
                             ),
                         }
                     ],
@@ -1096,8 +1229,8 @@ def make_recursive_query(
 
         return last_text
 
-    def _run_openai(prompt: str, content: str, depth: int) -> str:
-        tools = _openai_explore_tool_specs(allow_recurse=depth > 0)
+    def _run_openai(prompt: str, content: str, depth: int, tool_budget: dict[str, int]) -> str:
+        tools = _openai_explore_tool_specs(allow_recurse=depth > 0, available_helpers=_available_helpers)
         allowed_tools = {spec["function"]["name"] for spec in tools}
         messages: list[dict[str, Any]] = [{"role": "user", "content": content}]
 
@@ -1171,7 +1304,7 @@ def make_recursive_query(
                 result = (
                     parse_err
                     if parse_err is not None
-                    else _execute_tool_call(fn_name, parsed_args, depth, allowed_tools, prompt)
+                    else _execute_tool_call(fn_name, parsed_args, depth, allowed_tools, prompt, tool_budget)
                 )
                 messages.append({
                     "role": "tool",
@@ -1181,14 +1314,14 @@ def make_recursive_query(
 
         return last_text
 
-    def _run_claude_cli(prompt: str, content: str, depth: int) -> str:
+    def _run_claude_cli(prompt: str, content: str, depth: int, tool_budget: dict[str, int]) -> str:
         """Lookup loop over structured JSON output: the CLI child has only
         ``StructuredOutput`` and emits host lookup requests matching ``_cli_recurse_schema``."""
         allow_recurse = depth > 0
-        specs = _explore_tool_specs(allow_recurse=allow_recurse)
+        specs = _explore_tool_specs(allow_recurse=allow_recurse, available_helpers=_available_helpers)
         allowed_tools = {spec["name"] for spec in specs}
         op_names = ", ".join(spec["name"] for spec in specs)
-        schema = _cli_recurse_schema(allow_recurse=allow_recurse)
+        schema = _cli_recurse_schema(allow_recurse=allow_recurse, available_helpers=_available_helpers)
         catalog = "\n".join(
             f'- op="{spec["name"]}": {spec["description"]} '
             f'args: {json.dumps(spec["input_schema"]["properties"])}'
@@ -1286,7 +1419,7 @@ def make_recursive_query(
                 raw_args = item.get("args")
                 op_args = raw_args if isinstance(raw_args, dict) else {}
                 executed_requests.append({"op": op_name, "args": op_args})
-                tool_out = _execute_tool_call(op_name, op_args, depth, allowed_tools, prompt)
+                tool_out = _execute_tool_call(op_name, op_args, depth, allowed_tools, prompt, tool_budget)
                 result_blocks.append(f'<lookup_result op="{op_name}">\n{tool_out}\n</lookup_result>')
             if not executed_requests:
                 if iteration >= max_iterations - 2:
@@ -1309,13 +1442,14 @@ def make_recursive_query(
             raise ValueError("prompt cannot be empty")
         depth = max_depth if depth is None else depth
         content = f"Context:\n{context}\n\nQuestion: {prompt}" if context else prompt
+        tool_budget = {"remaining": _max_total_tool_chars}
         if _provider == "claude-cli":
-            return _run_claude_cli(prompt, content, depth)
+            return _run_claude_cli(prompt, content, depth, tool_budget)
         if _provider == "gemini":
-            return _run_gemini(prompt, content, depth)
+            return _run_gemini(prompt, content, depth, tool_budget)
         if _provider == "openai":
-            return _run_openai(prompt, content, depth)
-        return _run_anthropic(prompt, content, depth)
+            return _run_openai(prompt, content, depth, tool_budget)
+        return _run_anthropic(prompt, content, depth, tool_budget)
 
     def recursive_query(prompt: str, context: str = "") -> str:
         return _run(prompt, context)
@@ -1323,7 +1457,7 @@ def make_recursive_query(
     return recursive_query
 
 
-def make_llm_query_batched(llm_query_fn, max_workers: int = 8, *, on_batch=None):
+def make_llm_query_batched(llm_query_fn, max_workers: int | None = None, *, on_batch=None):
     def llm_query_batched(prompts: list[str], context: str = "") -> list[str]:
         if isinstance(prompts, (str, bytes)):
             raise TypeError("prompts must be a sequence of strings, not a single string")
@@ -1335,8 +1469,9 @@ def make_llm_query_batched(llm_query_fn, max_workers: int = 8, *, on_batch=None)
         if on_batch is not None:
             on_batch(len(prompts))
 
+        resolved_workers = max(8, _cli_concurrency()) if max_workers is None else max_workers
         results: dict[int, str] = {}
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=resolved_workers) as executor:
             future_to_idx = {
                 executor.submit(llm_query_fn, prompt, context): i
                 for i, prompt in enumerate(prompts)

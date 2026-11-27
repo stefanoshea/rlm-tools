@@ -30,6 +30,7 @@ MAX_GREP_LINE_BYTES = 500
 MAX_SUMMARY_LINE_CHARS = 300
 MAX_AST_BYTES = 1 * 1024 * 1024
 MAX_AST_CACHE_FILES = 8
+MAX_OUTLINE_SYMBOLS = 2_000
 _SNIFF_BYTES = 8 * 1024
 _MINIFIED_SNIFF_BYTES = 64 * 1024
 _MINIFIED_SIZE_CAP = 1024 * 1024
@@ -192,6 +193,64 @@ def _target_matches(lhs: str, target: str) -> bool:
     return "." not in target and lhs.endswith(f".{target}")
 
 
+def _format_expr_brief(node: ast.AST, max_chars: int = 120) -> str:
+    if isinstance(node, ast.Constant):
+        text = repr(node.value)
+    elif isinstance(node, (ast.Name, ast.Attribute)):
+        text = _dotted_name(node) or "<expr>"
+    else:
+        try:
+            text = ast.unparse(node)
+        except Exception:
+            text = "<expr>"
+    if len(text) > max_chars:
+        text = text[: max_chars - 3] + "..."
+    return text
+
+
+def _extract_decorators(node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef) -> list[dict]:
+    decorators: list[dict] = []
+    for dec in node.decorator_list:
+        if isinstance(dec, ast.Call):
+            name = _dotted_name(dec.func) or _format_expr_brief(dec.func)
+            entry: dict = {"name": name}
+            if dec.args:
+                entry["args"] = [_format_expr_brief(arg) for arg in dec.args[:10]]
+            if dec.keywords:
+                entry["kwargs"] = {
+                    (kw.arg or "**"): _format_expr_brief(kw.value)
+                    for kw in dec.keywords[:15]
+                }
+            decorators.append(entry)
+        else:
+            decorators.append({"name": _dotted_name(dec) or _format_expr_brief(dec)})
+    return decorators
+
+
+def _collect_init_attributes(init_node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
+    attrs: list[str] = []
+    seen: set[str] = set()
+    stack: list[ast.AST] = list(reversed(init_node.body))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        targets: list[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets = [node.target]
+        for tgt in targets:
+            for lhs in _extract_target_names(tgt):
+                if lhs.startswith("self."):
+                    attr = lhs[5:]
+                    if attr and "." not in attr and attr not in seen:
+                        seen.add(attr)
+                        attrs.append(attr)
+        stack.extend(reversed(list(ast.iter_child_nodes(node))))
+    return attrs
+
+
 def scan_metadata(base_path: str) -> dict:
     """Return counts for a bounded scan of the canonical workspace root."""
     workspace = Workspace(base_path, canonical=True)
@@ -344,8 +403,36 @@ def make_helpers(
                         cache_bytes += delta
                 return content
 
-    def read_file(path: str, max_bytes_read: int | None = None) -> str:
-        return read(path, byte_limit(max_bytes_read), new_budget())
+    def read_file(
+        path: str,
+        max_bytes_read: int | None = None,
+        start_line: int | None = None,
+        end_line: int | None = None,
+    ) -> str:
+        limit = byte_limit(max_bytes_read)
+        if start_line is None and end_line is None:
+            return read(path, limit, new_budget())
+        if start_line is not None and (type(start_line) is not int or start_line < 1):
+            raise ValueError("start_line must be a positive integer")
+        if end_line is not None and (type(end_line) is not int or end_line < 1):
+            raise ValueError("end_line must be a positive integer")
+        if start_line is not None and end_line is not None and end_line < start_line:
+            raise ValueError("end_line must be >= start_line")
+
+        content = read(path, MAX_FILE_BYTES, new_budget())
+        was_truncated = content.endswith(_TRUNCATION)
+        if was_truncated:
+            content = content[:-len(_TRUNCATION)]
+        lines = _split_source_lines(content)
+        start_idx = (start_line - 1) if start_line is not None else 0
+        sliced = lines[start_idx:end_line]
+        joined = "\n".join(sliced)
+        out_truncated = was_truncated and (end_line is None or end_line > len(lines))
+        if len(joined.encode("utf-8")) > limit:
+            return _text_limit(joined, limit) + _TRUNCATION
+        if out_truncated:
+            return joined + _TRUNCATION
+        return joined
 
     def read_files(paths: list[str], max_bytes_read: int | None = None) -> dict[str, str]:
         """Read multiple files at once. Returns {path: content} dict."""
@@ -453,6 +540,7 @@ def make_helpers(
                 if len(data) > initial_remaining or budget.remaining_bytes <= 0:
                     budget.mark_truncated("bytes")
                 elif budget.has_time():
+                    budget.record_oversized(str(file_path), info.st_size)
                     budget.mark_truncated("file_bytes")
 
             content = _decode(data[:allowed], complete)
@@ -621,7 +709,7 @@ def make_helpers(
         if budget.truncated:
             summary = f"{budget.format_truncation()}\n{summary}"
 
-        return {
+        response = {
             "matches": {fp: grouped[fp] for fp in file_contents},
             "files": file_contents,
             "summary": summary,
@@ -630,6 +718,9 @@ def make_helpers(
             "files_scanned": budget.files_scanned,
             "files_skipped": budget.files_skipped,
         }
+        if budget.oversized_files:
+            response["oversized_files"] = list(budget.oversized_files)
+        return response
 
     def glob_files(pattern: str) -> list[str]:
         if not pattern:
@@ -646,9 +737,12 @@ def make_helpers(
             raise ValueError("'**' can only be an entire path component")
         if len(parts) > MAX_PATH_DEPTH:
             raise ValueError("Glob pattern exceeds the workspace depth limit")
-        if not parts or pattern.endswith("/") or parts[-1] == "**":
+        if not parts or pattern.endswith("/"):
             return []
+        if parts[-1] == "**":
+            parts = parts + ("*",)
 
+        explicit_dot_dirs = any(part.startswith(".") for part in parts[:-1] if part != "**")
         selectors = [
             None if part == "**" else re.compile(translate(part))
             for part in parts
@@ -670,6 +764,19 @@ def make_helpers(
             return states
 
         def select_directory(path):
+            if path.name.startswith("."):
+                parent_states = positions(path.parent) if len(path.parts) > 1 else {0}
+                for index in parent_states:
+                    while index < len(parts) and selectors[index] is None:
+                        index += 1
+                    if (
+                        index < len(parts) - 1
+                        and selectors[index] is not None
+                        and parts[index].startswith(".")
+                        and selectors[index].match(path.name)
+                    ):
+                        return True
+                return False
             return any(index < len(parts) for index in positions(path))
 
         matches = []
@@ -678,7 +785,12 @@ def make_helpers(
         root = pathlib.Path(".")
         with workspace.open(root, directory=True) as (fd, _):
             for _, path in workspace.files(
-                fd, root, budget, include_hidden=True, select_directory=select_directory,
+                fd,
+                root,
+                budget,
+                include_hidden=True,
+                include_hidden_dirs=explicit_dot_dirs,
+                select_directory=select_directory,
             ):
                 if len(parts) not in positions(path):
                     continue
@@ -912,6 +1024,131 @@ def make_helpers(
         hits.sort(key=lambda item: item["line_number"])
         return hits
 
+    def outline(path: str) -> dict:
+        """Return classes, functions, methods, decorators, fields, and line spans for a Python file."""
+        budget = new_budget()
+        parsed, lines = _parse_python_ast(path, budget)
+        target = workspace.relative(path)
+
+        classes: list[dict] = []
+        functions: list[dict] = []
+        symbol_count = 0
+        truncated = False
+        try_star_type = getattr(ast, "TryStar", None)
+
+        stack: list[tuple[ast.AST, list[str], dict | None]] = [
+            (stmt, [], None) for stmt in reversed(parsed.body)
+        ]
+        steps = 0
+        while stack:
+            steps += 1
+            if (steps & 0x3FF) == 0 and not budget.has_time():
+                raise TimeoutError("AST inspection deadline exceeded")
+            stmt, scope_chain, cls_dict = stack.pop()
+
+            if isinstance(stmt, ast.ClassDef):
+                if symbol_count >= MAX_OUTLINE_SYMBOLS:
+                    truncated = True
+                    break
+                symbol_count += 1
+                end_line = getattr(stmt, "end_lineno", stmt.lineno) or stmt.lineno
+                fields: list[str] = []
+                seen_fields: set[str] = set()
+                for member in stmt.body:
+                    targets: list[ast.AST] = []
+                    if isinstance(member, ast.AnnAssign):
+                        targets = [member.target]
+                    elif isinstance(member, ast.Assign):
+                        targets = list(member.targets)
+                    for tgt in targets:
+                        for name in _extract_target_names(tgt):
+                            if "." not in name and name not in seen_fields:
+                                seen_fields.add(name)
+                                fields.append(name)
+
+                cls_entry: dict = {
+                    "name": stmt.name,
+                    "qualified": ".".join([*scope_chain, stmt.name]),
+                    "bases": [_format_expr_brief(base) for base in stmt.bases],
+                    "start_line": stmt.lineno,
+                    "end_line": end_line,
+                    "lines": end_line - stmt.lineno + 1,
+                    "decorators": _extract_decorators(stmt),
+                    "fields": fields,
+                    "field_count": len(fields),
+                    "init_attributes": [],
+                    "methods": [],
+                }
+                if stmt.decorator_list:
+                    cls_entry["decorator_line"] = min(
+                        getattr(d, "lineno", stmt.lineno) for d in stmt.decorator_list
+                    )
+                classes.append(cls_entry)
+                child_scope = [*scope_chain, stmt.name]
+                for child in reversed(stmt.body):
+                    stack.append((child, child_scope, cls_entry))
+                continue
+
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if symbol_count >= MAX_OUTLINE_SYMBOLS:
+                    truncated = True
+                    break
+                symbol_count += 1
+                end_line = getattr(stmt, "end_lineno", stmt.lineno) or stmt.lineno
+                fn_entry: dict = {
+                    "name": stmt.name,
+                    "qualified": ".".join([*scope_chain, stmt.name]),
+                    "kind": "async_function" if isinstance(stmt, ast.AsyncFunctionDef) else "function",
+                    "start_line": stmt.lineno,
+                    "end_line": end_line,
+                    "lines": end_line - stmt.lineno + 1,
+                    "decorators": _extract_decorators(stmt),
+                }
+                if stmt.decorator_list:
+                    fn_entry["decorator_line"] = min(
+                        getattr(d, "lineno", stmt.lineno) for d in stmt.decorator_list
+                    )
+                if cls_dict is not None:
+                    cls_dict["methods"].append(fn_entry)
+                    if stmt.name == "__init__" and not cls_dict["init_attributes"]:
+                        cls_dict["init_attributes"] = _collect_init_attributes(stmt)
+                else:
+                    functions.append(fn_entry)
+                child_scope = [*scope_chain, stmt.name]
+                for child in reversed(stmt.body):
+                    stack.append((child, child_scope, None))
+                continue
+
+            if isinstance(stmt, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith)):
+                for child in reversed(getattr(stmt, "orelse", ())):
+                    stack.append((child, scope_chain, cls_dict))
+                for child in reversed(stmt.body):
+                    stack.append((child, scope_chain, cls_dict))
+            elif isinstance(stmt, ast.Try) or (try_star_type is not None and isinstance(stmt, try_star_type)):
+                for child in reversed(stmt.finalbody):
+                    stack.append((child, scope_chain, cls_dict))
+                for child in reversed(stmt.orelse):
+                    stack.append((child, scope_chain, cls_dict))
+                for handler in reversed(stmt.handlers):
+                    for child in reversed(handler.body):
+                        stack.append((child, scope_chain, cls_dict))
+                for child in reversed(stmt.body):
+                    stack.append((child, scope_chain, cls_dict))
+            elif isinstance(stmt, ast.Match):
+                for case in reversed(stmt.cases):
+                    for child in reversed(case.body):
+                        stack.append((child, scope_chain, cls_dict))
+
+        result: dict = {
+            "path": str(target),
+            "total_lines": len(lines),
+            "classes": classes,
+            "functions": functions,
+        }
+        if truncated:
+            result["truncated"] = True
+        return result
+
     return {
         "read_file": read_file,
         "read_files": read_files,
@@ -920,6 +1157,7 @@ def make_helpers(
         "grep_read": grep_read,
         "glob_files": glob_files,
         "tree": tree,
+        "outline": outline,
         "enclosing": enclosing,
         "find_assignments": find_assignments,
     }, workspace

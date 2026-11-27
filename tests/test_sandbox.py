@@ -20,7 +20,9 @@ def test_variables_persist_between_executions():
 def test_output_truncated():
     sandbox = Sandbox(base_path="/tmp", max_output_chars=50)
     result = sandbox.execute("print('a' * 200)")
-    assert len(result.stdout) <= 80  # 50 + truncation message
+    assert "... [output truncated]" in result.stdout
+    assert "(50/201 chars, 1/1 lines)" in result.stdout
+    assert len(result.stdout) <= 140
 
 
 def test_blocked_imports():
