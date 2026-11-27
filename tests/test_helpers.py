@@ -925,3 +925,59 @@ def test_outline_extracts_classes_fields_decorators_and_multiline_defs(tmp_path)
 
     deep_out = helpers["outline"]("deep_dec.py")
     assert deep_out["functions"][0]["name"] == "f"
+
+
+def test_outline_nested_functions_and_methods_parent_and_depth(tmp_path):
+    (tmp_path / "nested.py").write_text(
+        "def top_fn():\n"
+        "    def inner_fn():\n"
+        "        def deepest():\n"
+        "            return 1\n"
+        "        return deepest()\n"
+        "    return inner_fn()\n"
+        "\n"
+        "class Outer:\n"
+        "    def method(self):\n"
+        "        def inner_in_method():\n"
+        "            return 2\n"
+        "        return inner_in_method()\n",
+        encoding="utf-8",
+    )
+    helpers, _ = make_helpers(str(tmp_path))
+    out = helpers["outline"]("nested.py")
+
+    fn_by_qual = {fn["qualified"]: fn for fn in out["functions"]}
+    assert fn_by_qual["top_fn"]["parent"] is None
+    assert fn_by_qual["top_fn"]["depth"] == 0
+    assert fn_by_qual["top_fn.inner_fn"]["parent"] == "top_fn"
+    assert fn_by_qual["top_fn.inner_fn"]["depth"] == 1
+    assert fn_by_qual["top_fn.inner_fn.deepest"]["parent"] == "top_fn.inner_fn"
+    assert fn_by_qual["top_fn.inner_fn.deepest"]["depth"] == 2
+    assert fn_by_qual["Outer.method.inner_in_method"]["parent"] == "Outer.method"
+    assert fn_by_qual["Outer.method.inner_in_method"]["depth"] == 2
+
+    cls = out["classes"][0]
+    assert cls["parent"] is None
+    assert cls["depth"] == 0
+    method = cls["methods"][0]
+    assert method["qualified"] == "Outer.method"
+    assert method["parent"] == "Outer"
+    assert method["depth"] == 1
+
+
+def test_glob_files_dir_globstar_env_example_and_mcp_json(tmp_path):
+    (tmp_path / "dir").mkdir()
+    (tmp_path / "dir" / ".env.example").write_text("KEY=value\n")
+    (tmp_path / "dir" / ".mcp.json").write_text('{"mcpServers":{}}\n')
+    (tmp_path / "dir" / ".env").write_text("SECRET=1\n")
+    (tmp_path / "dir" / ".mcp.local.json").write_text('{"secret":1}\n')
+
+    helpers, _ = make_helpers(str(tmp_path))
+    assert helpers["glob_files"]("dir/**") == ["dir/.env.example", "dir/.mcp.json"]
+
+    # When .mcp.json is gitignored, default glob_files skips it and include_ignored=True returns it,
+    # while private files (.env, .mcp.local.json) remain excluded in both modes.
+    (tmp_path / ".gitignore").write_text(".mcp.json\n")
+    helpers_gi, _ = make_helpers(str(tmp_path))
+    assert helpers_gi["glob_files"]("dir/**") == ["dir/.env.example"]
+    assert helpers_gi["glob_files"]("dir/**", include_ignored=True) == ["dir/.env.example", "dir/.mcp.json"]

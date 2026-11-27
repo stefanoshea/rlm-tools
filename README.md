@@ -129,16 +129,16 @@ The sandbox provides built-in helpers:
 
 - `read_file(path, start_line=None, end_line=None)` / `read_files(paths)` — Read files or line slices into variables (cached across calls)
 - `grep(pattern)` / `grep_summary(pattern)` / `grep_read(pattern)` — Search
-- `glob_files(pattern)` — Find files by pattern
+- `glob_files(pattern, include_ignored=False)` — Find files by pattern (pass `include_ignored=True` to include `.gitignore`d non-secret files)
 - `tree(path, max_depth)` — Directory structure
-- `outline(path)` / `enclosing(path, line)` / `find_assignments(path, target)` — Python AST outline, scope, and assignment lookup
-- `llm_query(prompt, context)` / `llm_query_batched(prompts, context)` — Sub-LLM analysis (optional, requires a provider key, `OPENAI_BASE_URL`, or `RLM_SUB_PROVIDER=claude-cli`)
-- `rlm_recurse(prompt, context)` / `rlm_recurse_batched(prompts, context)` — Ask a sub-agent to explore the session directory (optional, requires a provider key, `OPENAI_BASE_URL`, or `RLM_SUB_PROVIDER=claude-cli`)
+- `outline(path)` / `enclosing(path, line)` / `find_assignments(path, target)` — Python AST outline (with `parent` and `depth` on every class/function), scope, and assignment lookup
+- `llm_query(prompt, context)` / `llm_query_batched(prompts, context)` — Sub-LLM analysis when full context is already in the prompt (optional, requires a provider key, `OPENAI_BASE_URL`, or `RLM_SUB_PROVIDER=claude-cli`)
+- `rlm_recurse(prompt, context)` / `rlm_recurse_batched(prompts, context)` — Ask a sub-agent to explore the session directory and check code (optional, requires a provider key, `OPENAI_BASE_URL`, or `RLM_SUB_PROVIDER=claude-cli`; `max_llm_calls` defaults to `300`, size `≈ 4×N` for N-item recursion; children hitting `RLM_CHILD_MAX_TOTAL_TOOL_CHARS` return a `[BUDGET_EXHAUSTED]` prefix and increment `usage.child_budget_exhausted`)
 
-The sandbox allows only these imports: `re`, `json`, `collections`, `math`, `fnmatch`, `itertools`, `functools`, `operator`, `string`, `textwrap`, `difflib`, `statistics`. `os`, `glob`, `pathlib`, `ast`, `open()`, `exec()`, `eval()`, `getattr()`, and `str.format()` are blocked. Use the helpers and f-strings instead. `rlm_start` returns the current `allowed_imports` list.
+The sandbox allows only these imports: `re`, `json`, `collections`, `math`, `fnmatch`, `itertools`, `functools`, `operator`, `string`, `textwrap`, `difflib`, `statistics`. `os`, `glob`, `pathlib`, `ast`, `open()`, `exec()`, `eval()`, `getattr()`, and `str.format()` are blocked. Use the helpers and f-strings instead. `rlm_start` returns the current `allowed_imports` list (and `other_open_sessions` if you already have sessions open).
 - `rlm_finalize(value)` — Return structured final output in `rlm_execute` responses
 
-Variables persist across `rlm_execute` calls within a session. The agent can build up understanding incrementally — search, filter, read, analyze — without any intermediate data touching the context window.
+Variables persist across `rlm_execute` calls within a session (and truncated stdout is retained in `_last_stdout` for follow-up paging). The agent can build up understanding incrementally — search, filter, read, analyze — without any intermediate data touching the context window.
 
 ### Evidence Gate
 

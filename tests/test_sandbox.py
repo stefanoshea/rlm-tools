@@ -25,6 +25,31 @@ def test_output_truncated():
     assert len(result.stdout) <= 140
 
 
+def test_truncated_stdout_saved_in_last_stdout_for_paging(tmp_path):
+    sandbox = Sandbox(base_path=str(tmp_path), max_output_chars=50)
+    try:
+        payload = "".join(f"{i % 10}" for i in range(150))
+        first = sandbox.execute(f"print({payload!r})")
+        assert "... [output truncated] (50/151 chars, 1/1 lines)" in first.stdout
+        assert "_last_stdout" in first.stdout
+        assert "_last_stdout" not in sandbox.list_variables()
+
+        page1 = sandbox.execute("print(_last_stdout[50:90])")
+        assert page1.error is None
+        assert page1.stdout == payload[50:90] + "\n"
+
+        # Non-truncated paging call must not overwrite _last_stdout.
+        page2 = sandbox.execute("print(_last_stdout[90:130])")
+        assert page2.error is None
+        assert page2.stdout == payload[90:130] + "\n"
+
+        page3 = sandbox.execute("print(_last_stdout[130:150])")
+        assert page3.error is None
+        assert page3.stdout == payload[130:150] + "\n"
+    finally:
+        sandbox.close()
+
+
 def test_blocked_imports():
     sandbox = Sandbox(base_path="/tmp", max_output_chars=10_000)
     result = sandbox.execute("import subprocess")

@@ -84,9 +84,13 @@ def _shallow_size(value) -> int:
 
 
 class _OutputCapture(io.StringIO):
-    def __init__(self, limit: int):
+    def __init__(self, limit: int, full_limit: int = 0):
         super().__init__()
         self._limit = max(0, limit)
+        self._full_limit = max(0, full_limit)
+        self._full_buf = io.StringIO()
+        self._full_len = 0
+        self.full_truncated = False
         self.truncated = False
         self.total_chars = 0
         self._completed_total_lines = 0
@@ -105,6 +109,17 @@ class _OutputCapture(io.StringIO):
         else:
             self._total_in_line = True
 
+        if self._full_limit > 0:
+            full_remaining = self._full_limit - self._full_len
+            if len(text) > full_remaining:
+                self.full_truncated = True
+                if full_remaining > 0:
+                    self._full_buf.write(text[:full_remaining])
+                    self._full_len += full_remaining
+            else:
+                self._full_buf.write(text)
+                self._full_len += len(text)
+
         remaining = self._limit - self.tell()
         if len(text) > remaining:
             self.truncated = True
@@ -120,6 +135,9 @@ class _OutputCapture(io.StringIO):
                 self._kept_in_line = True
         super().write(text_to_keep)
         return len(text)
+
+    def full_getvalue(self) -> str:
+        return self._full_buf.getvalue()
 
     @property
     def total_lines(self) -> int:
@@ -360,7 +378,8 @@ class WorkerRuntime:
             signal.signal(signal.SIGALRM, previous_handler)
 
     def execute(self, code: str) -> ExecuteResponse:
-        stdout_capture = _OutputCapture(self._max_output_chars)
+        full_limit = min(self._max_memory_bytes // 4, 2_000_000)
+        stdout_capture = _OutputCapture(self._max_output_chars, full_limit=full_limit)
         error = None
         self._final_result = None
 
@@ -374,9 +393,17 @@ class WorkerRuntime:
 
         stdout = stdout_capture.getvalue()
         if stdout_capture.truncated:
+            hint = ""
+            if full_limit > 0:
+                saved_stdout = stdout_capture.full_getvalue()
+                self._namespace["_last_stdout"] = saved_stdout
+                if stdout_capture.full_truncated:
+                    hint = f" — first {len(saved_stdout)} chars in _last_stdout"
+                else:
+                    hint = " — saved in _last_stdout"
             stdout += (
                 f"\n... [output truncated] ({len(stdout)}/{stdout_capture.total_chars} chars, "
-                f"{stdout_capture.kept_lines}/{stdout_capture.total_lines} lines)"
+                f"{stdout_capture.kept_lines}/{stdout_capture.total_lines} lines){hint}"
             )
 
         memory_bytes_used = self._measure_user_memory(limit=self._max_memory_bytes)

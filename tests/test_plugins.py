@@ -200,3 +200,16 @@ def test_claude_plugin_subagent_rlm_explorer():
         assert tool_name in disallowed
     for mcp_tool in ("rlm_start", "rlm_execute", "rlm_end"):
         assert mcp_tool in body
+
+
+def test_skill_and_agent_document_llm_budget_sizing_and_recurse_routing():
+    skill_body = (REPO_ROOT / "skills" / "rlm-explore" / "SKILL.md").read_text(encoding="utf-8")
+    agent_body = (REPO_ROOT / "plugins" / "rlm-tools" / "agents" / "rlm-explorer.md").read_text(encoding="utf-8")
+
+    for text in (skill_body, agent_body):
+        assert "max_llm_calls" in text
+        assert "4×N" in text
+        assert "rlm_recurse_batched" in text
+        assert "llm_query" in text
+        assert "not pasted text" in text
+        assert "[BUDGET_EXHAUSTED]" in text

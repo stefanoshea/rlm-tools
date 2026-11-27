@@ -300,6 +300,7 @@ def test_new_defaults():
 
         result = _rlm_start(path=tmpdir, query="test defaults")
         data = json.loads(result)
+        assert data["limits"]["max_llm_calls"] == 300
         assert data["limits"]["max_execute_calls"] == 100
         assert data["limits"]["execution_timeout_seconds"] == 30
         assert data["limits"]["max_memory_bytes"] == 64 * 1024 * 1024
@@ -770,3 +771,135 @@ def test_rlm_end_returns_usage_and_budget_warning_and_outline_in_sandbox(externa
     assert ended["success"] is True
     assert ended["usage"]["execute_calls_used"] == 1
     assert ended["usage"]["sub_llm_usage"]["total_cost_usd"] == pytest.approx(0.001)
+
+
+def test_rlm_recurse_batched_preflight_budget_check_and_llm_budget_note(external_test_roots, tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    client = MagicMock()
+
+    with patch("rlm_tools.llm_bridge.get_client", return_value=client):
+        started = json.loads(_rlm_start(str(tmp_path), "batch budget", max_llm_calls=10))
+        sid = started["session_id"]
+        try:
+            assert "4×N" in started["llm_budget_note"]
+            assert "max_llm_calls" in started["llm_budget_note"]
+
+            res = json.loads(_rlm_execute(
+                sid,
+                "rlm_recurse_batched(['p1', 'p2', 'p3', 'p4'])",
+                detail_level="usage",
+            ))
+            assert res["error"] is not None
+            assert "LLM call budget too small" in res["error"]
+            assert "max_llm_calls >= 16" in res["error"]
+            assert res["usage"]["llm_calls_used"] == 0
+            assert res["usage"]["llm_calls_remaining"] == 10
+            client.messages.create.assert_not_called()
+        finally:
+            _rlm_end(sid)
+
+
+def test_llm_call_budget_warning(external_test_roots, tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    client = MagicMock()
+    client.messages.create.return_value = MagicMock(
+        content=[MagicMock(type="text", text="ok")],
+        usage=MagicMock(input_tokens=5, output_tokens=2),
+    )
+
+    with patch("rlm_tools.llm_bridge.get_client", return_value=client):
+        started = json.loads(_rlm_start(str(tmp_path), "llm warning", max_llm_calls=5))
+        sid = started["session_id"]
+        try:
+            out1 = json.loads(_rlm_execute(
+                sid,
+                "for _ in range(4):\n    llm_query('hi')\nprint('done')",
+                detail_level="usage",
+            ))
+            assert out1["error"] is None
+            assert out1["usage"]["llm_calls_used"] == 4
+            assert out1["usage"]["llm_calls_remaining"] == 1
+            assert "1 LLM calls remaining (of 5)" in out1["budget_warning"]
+
+            out2 = json.loads(_rlm_execute(sid, "llm_query('last')\nprint('zero')"))
+            assert out2["error"] is None
+            assert "0 LLM calls remaining (of 5)" in out2["budget_warning"]
+        finally:
+            _rlm_end(sid)
+
+
+def test_child_tool_output_budget_exhaustion_surfaced_in_usage_and_warning(external_test_roots, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    (tmp_path / "big.py").write_text("x = 1\n" * 50)
+    (tmp_path / "small.py").write_text("ok = True\n")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("RLM_CHILD_MAX_TOTAL_TOOL_CHARS", "60")
+    monkeypatch.setenv("RLM_CHILD_MAX_TOOL_CHARS", "500")
+
+    def fake_create(**kwargs):
+        messages = kwargs["messages"]
+        first_msg = messages[0]["content"]
+        if len(messages) == 1:
+            target = "big.py" if "big.py" in first_msg else "small.py"
+            return SimpleNamespace(
+                stop_reason="tool_use",
+                content=[SimpleNamespace(type="tool_use", id="t1", name="read_file", input={"path": target})],
+                usage=SimpleNamespace(input_tokens=10, output_tokens=5),
+            )
+        final_text = "[]" if "big.py" in first_msg else "clean"
+        return SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text=final_text)],
+            usage=SimpleNamespace(input_tokens=12, output_tokens=4),
+        )
+
+    client = MagicMock()
+    client.messages.create.side_effect = fake_create
+
+    with patch("rlm_tools.llm_bridge.get_client", return_value=client):
+        started = json.loads(_rlm_start(str(tmp_path), "child budget"))
+        sid = started["session_id"]
+        try:
+            out = json.loads(_rlm_execute(
+                sid,
+                "import json\n"
+                "res = rlm_recurse_batched(['inspect big.py', 'inspect small.py'])\n"
+                "print(json.dumps(res))",
+                detail_level="usage",
+            ))
+            assert out["error"] is None
+            items = json.loads(out["stdout"])
+            assert items[0].startswith("[BUDGET_EXHAUSTED]")
+            assert items[1] == "clean"
+            assert "1 child(ren) hit the tool output budget" in out["budget_warning"]
+            assert out["usage"]["child_budget_exhausted"] == 1
+        finally:
+            ended = json.loads(_rlm_end(sid))
+
+    assert ended["usage"]["child_budget_exhausted"] == 1
+
+
+def test_rlm_start_lists_other_open_sessions(tmp_path, monkeypatch):
+    from rlm_tools import server
+    from rlm_tools.session import SessionManager
+
+    monkeypatch.setattr(server, "session_manager", SessionManager())
+    monkeypatch.setattr(server, "_sandboxes", {})
+
+    s1 = json.loads(server._rlm_start(str(tmp_path), "first"))
+    sid1 = s1["session_id"]
+    assert "other_open_sessions" not in s1
+
+    s2 = json.loads(server._rlm_start(str(tmp_path), "second"))
+    sid2 = s2["session_id"]
+    assert s2["other_open_sessions"] == [sid1]
+
+    server._rlm_end(sid1)
+    s3 = json.loads(server._rlm_start(str(tmp_path), "third"))
+    sid3 = s3["session_id"]
+    try:
+        assert s3["other_open_sessions"] == [sid2]
+    finally:
+        server._rlm_end(sid2)
+        server._rlm_end(sid3)

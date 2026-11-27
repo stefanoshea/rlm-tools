@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 
 DEFAULT_MAX_MEMORY_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_LLM_CALLS = 300
 
 
 def default_max_memory_bytes() -> int:
@@ -29,13 +30,14 @@ class Session:
     created_at: float = field(default_factory=time.time)
     last_used: float = field(default_factory=time.time)
     max_output_chars: int = 15_000
-    max_llm_calls: int = 50
+    max_llm_calls: int = DEFAULT_MAX_LLM_CALLS
     llm_calls_used: int = 0
     max_execute_calls: int = 100
     execute_calls: int = 0
     memory_bytes_used: int = 0
     max_memory_bytes: int = field(default_factory=default_max_memory_bytes)
     sub_llm_usage: dict[str, int | float] = field(default_factory=dict)
+    child_budget_exhausted: int = 0
     _operation_ready: threading.Condition = field(default_factory=threading.Condition, repr=False, compare=False)
     _next_operation: int = field(default=0, init=False, repr=False, compare=False)
     _current_operation: int = field(default=0, init=False, repr=False, compare=False)
@@ -61,7 +63,7 @@ class SessionManager:
         path: str,
         query: str,
         max_output_chars: int = 15_000,
-        max_llm_calls: int = 50,
+        max_llm_calls: int = DEFAULT_MAX_LLM_CALLS,
         max_execute_calls: int = 100,
         max_memory_bytes: int | None = None,
         *,
@@ -168,6 +170,17 @@ class SessionManager:
     def end(self, session_id: str) -> None:
         with self._lock:
             self._sessions.pop(session_id, None)
+
+    def list_other_session_ids(self, exclude_session_id: str) -> list[str]:
+        with self._lock:
+            self._cleanup_expired_locked()
+            return [
+                sid
+                for sid, _ in sorted(
+                    ((sid, s.created_at) for sid, s in self._sessions.items() if sid != exclude_session_id),
+                    key=lambda kv: kv[1],
+                )
+            ]
 
     def cleanup_expired(self) -> list[str]:
         with self._lock:

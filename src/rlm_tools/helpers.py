@@ -722,7 +722,7 @@ def make_helpers(
             response["oversized_files"] = list(budget.oversized_files)
         return response
 
-    def glob_files(pattern: str) -> list[str]:
+    def glob_files(pattern: str, include_ignored: bool = False) -> list[str]:
         if not pattern:
             raise ValueError("Unacceptable pattern: ''")
         if len(pattern) > MAX_PATTERN_LENGTH:
@@ -791,6 +791,7 @@ def make_helpers(
                 include_hidden=True,
                 include_hidden_dirs=explicit_dot_dirs,
                 select_directory=select_directory,
+                respect_gitignore=not include_ignored,
             ):
                 if len(parts) not in positions(path):
                     continue
@@ -1025,7 +1026,12 @@ def make_helpers(
         return hits
 
     def outline(path: str) -> dict:
-        """Return classes, functions, methods, decorators, fields, and line spans for a Python file."""
+        """Return classes, functions, methods, decorators, fields, and line spans for a Python file.
+
+        Each entry includes ``parent`` (``None`` for module-level definitions, or the
+        enclosing qualified name) and ``depth`` (``0`` for module-level, ``>= 1`` for
+        methods and nested definitions).
+        """
         budget = new_budget()
         parsed, lines = _parse_python_ast(path, budget)
         target = workspace.relative(path)
@@ -1069,6 +1075,8 @@ def make_helpers(
                 cls_entry: dict = {
                     "name": stmt.name,
                     "qualified": ".".join([*scope_chain, stmt.name]),
+                    "parent": ".".join(scope_chain) if scope_chain else None,
+                    "depth": len(scope_chain),
                     "bases": [_format_expr_brief(base) for base in stmt.bases],
                     "start_line": stmt.lineno,
                     "end_line": end_line,
@@ -1098,6 +1106,8 @@ def make_helpers(
                 fn_entry: dict = {
                     "name": stmt.name,
                     "qualified": ".".join([*scope_chain, stmt.name]),
+                    "parent": ".".join(scope_chain) if scope_chain else None,
+                    "depth": len(scope_chain),
                     "kind": "async_function" if isinstance(stmt, ast.AsyncFunctionDef) else "function",
                     "start_line": stmt.lineno,
                     "end_line": end_line,

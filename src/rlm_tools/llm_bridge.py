@@ -29,6 +29,7 @@ DEFAULT_CLAUDE_CLI_MODEL = "haiku"
 DEFAULT_CLI_MAX_CONCURRENCY = 8
 DEFAULT_CHILD_MAX_TOOL_CHARS = 24_000
 DEFAULT_CHILD_MAX_TOTAL_TOOL_CHARS = 96_000
+CHILD_BUDGET_EXHAUSTED_PREFIX = "[BUDGET_EXHAUSTED]"
 _CLI_ERROR_LIMIT = 400
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_MAX_RETRIES = 3
@@ -888,7 +889,8 @@ def _explore_tool_specs(
         {
             "name": "outline",
             "description": (
-                "Return Python AST outline (classes, methods, functions, decorators, fields, and exact line spans) "
+                "Return Python AST outline (classes, methods, functions with parent/depth "
+                "[parent=None, depth=0 for module-level defs], decorators, fields, and exact line spans) "
                 "for a .py file."
             ),
             "input_schema": {
@@ -1002,6 +1004,7 @@ def make_recursive_query(
     *,
     provider: str | None = None,
     on_usage: Callable[[dict[str, int | float]], None] | None = None,
+    on_child_budget_exhausted: Callable[[], None] | None = None,
 ):
     """Build a genuinely recursive explorer.
 
@@ -1078,7 +1081,7 @@ def make_recursive_query(
         depth: int,
         allowed_tools: set[str],
         prompt: str,
-        tool_budget: dict[str, int],
+        tool_budget: dict[str, Any],
     ) -> str:
         if name not in allowed_tools:
             return f"[error: unknown tool '{name}']"
@@ -1096,6 +1099,7 @@ def make_recursive_query(
             )
         rem = tool_budget["remaining"]
         if rem <= 0:
+            tool_budget["exhausted"] = True
             return "[tool output budget reached — synthesize your answer from previous results]"
         if len(result) > rem:
             orig_len = len(result)
@@ -1104,6 +1108,7 @@ def make_recursive_query(
                 + f"\n... [child tool output budget reached ({orig_len:,} chars); synthesize now]"
             )
             tool_budget["remaining"] = 0
+            tool_budget["exhausted"] = True
         else:
             tool_budget["remaining"] = rem - len(result)
         return result
@@ -1442,14 +1447,24 @@ def make_recursive_query(
             raise ValueError("prompt cannot be empty")
         depth = max_depth if depth is None else depth
         content = f"Context:\n{context}\n\nQuestion: {prompt}" if context else prompt
-        tool_budget = {"remaining": _max_total_tool_chars}
+        tool_budget: dict[str, Any] = {"remaining": _max_total_tool_chars, "exhausted": False}
         if _provider == "claude-cli":
-            return _run_claude_cli(prompt, content, depth, tool_budget)
-        if _provider == "gemini":
-            return _run_gemini(prompt, content, depth, tool_budget)
-        if _provider == "openai":
-            return _run_openai(prompt, content, depth, tool_budget)
-        return _run_anthropic(prompt, content, depth, tool_budget)
+            answer = _run_claude_cli(prompt, content, depth, tool_budget)
+        elif _provider == "gemini":
+            answer = _run_gemini(prompt, content, depth, tool_budget)
+        elif _provider == "openai":
+            answer = _run_openai(prompt, content, depth, tool_budget)
+        else:
+            answer = _run_anthropic(prompt, content, depth, tool_budget)
+        if tool_budget["exhausted"]:
+            if on_child_budget_exhausted is not None:
+                on_child_budget_exhausted()
+            header = (
+                f"{CHILD_BUDGET_EXHAUSTED_PREFIX} (child hit {_max_total_tool_chars:,}-char "
+                "tool output budget; answer may be incomplete)"
+            )
+            return f"{header}\n{answer}" if answer else header
+        return answer
 
     def recursive_query(prompt: str, context: str = "") -> str:
         return _run(prompt, context)
@@ -1457,7 +1472,7 @@ def make_recursive_query(
     return recursive_query
 
 
-def make_llm_query_batched(llm_query_fn, max_workers: int | None = None, *, on_batch=None):
+def make_llm_query_batched(llm_query_fn, max_workers: int | None = None, *, on_batch=None, check_batch=None):
     def llm_query_batched(prompts: list[str], context: str = "") -> list[str]:
         if isinstance(prompts, (str, bytes)):
             raise TypeError("prompts must be a sequence of strings, not a single string")
@@ -1466,6 +1481,8 @@ def make_llm_query_batched(llm_query_fn, max_workers: int | None = None, *, on_b
 
         if len(prompts) > 64:
             raise ValueError("A model batch accepts at most 64 prompts")
+        if check_batch is not None:
+            check_batch(len(prompts))
         if on_batch is not None:
             on_batch(len(prompts))
 

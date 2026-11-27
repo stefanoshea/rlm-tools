@@ -12,7 +12,12 @@ from pydantic import Field
 from rlm_tools._workspace import scan_limits
 from rlm_tools.access_policy import workspace_policy
 from rlm_tools.helpers import scan_metadata as _scan_metadata
-from rlm_tools.session import Session, SessionManager, default_max_memory_bytes
+from rlm_tools.session import (
+    DEFAULT_MAX_LLM_CALLS,
+    Session,
+    SessionManager,
+    default_max_memory_bytes,
+)
 from rlm_tools.sandbox import Sandbox
 from rlm_tools.llm_bridge import (
     has_configured_provider,
@@ -28,6 +33,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("rlm-tools")
+RECURSE_ESTIMATED_CALLS_PER_ITEM = 4
 
 session_manager = SessionManager(
     max_sessions=int(os.environ.get("RLM_MAX_SESSIONS", "16")),
@@ -74,6 +80,21 @@ def _make_call_reserver(session):
                 )
             session.llm_calls_used += count
 
+    def check_recurse_batch(num_prompts: int) -> None:
+        estimated = num_prompts * RECURSE_ESTIMATED_CALLS_PER_ITEM
+        with lock:
+            remaining = max(0, session.max_llm_calls - session.llm_calls_used)
+        if estimated > remaining:
+            max_fit = remaining // RECURSE_ESTIMATED_CALLS_PER_ITEM
+            raise RuntimeError(
+                f"LLM call budget too small for rlm_recurse_batched: {num_prompts} prompts "
+                f"need ~{estimated} calls (~{RECURSE_ESTIMATED_CALLS_PER_ITEM} per item), "
+                f"but only {remaining} of {session.max_llm_calls} remain. "
+                f"Start a session with max_llm_calls >= {estimated} "
+                f"(or split into batches of <= {max_fit})."
+            )
+
+    reserve.check_recurse_batch = check_recurse_batch
     return reserve
 
 
@@ -124,6 +145,10 @@ def _install_session_llm_tools(session, sandbox: Sandbox) -> bool:
                     total = prev + value
                     session.sub_llm_usage[key] = round(total, 6) if isinstance(total, float) else total
 
+        def record_child_budget_exhausted() -> None:
+            with usage_lock:
+                session.child_budget_exhausted += 1
+
         gate = _make_recurse_gate(session, reserve=_reserve_llm_calls, deadline=sandbox.execution_deadline)
         base_llm_query = make_llm_query(
             on_retry=lambda: _reserve_llm_calls(1),
@@ -146,8 +171,12 @@ def _install_session_llm_tools(session, sandbox: Sandbox) -> bool:
             gate=gate,
             deadline=sandbox.execution_deadline,
             on_usage=record_usage,
+            on_child_budget_exhausted=record_child_budget_exhausted,
         )
-        recursive_query_batched = make_llm_query_batched(recursive_query)
+        recursive_query_batched = make_llm_query_batched(
+            recursive_query,
+            check_batch=_reserve_llm_calls.check_recurse_batch,
+        )
     except Exception as e:
         logger.warning(f"Could not initialize llm_query: {e}")
         return False
@@ -163,7 +192,7 @@ def _rlm_start(
     path: str,
     query: str,
     max_output_chars: int = 15_000,
-    max_llm_calls: int = 50,
+    max_llm_calls: int = DEFAULT_MAX_LLM_CALLS,
     max_execute_calls: int = 100,
     execution_timeout_seconds: int | None = None,
     include_guidance: bool = False,
@@ -263,9 +292,9 @@ def _initialize_session(
         "grep(pattern, path='.', max_matches=None, allow_partial=False) -> list[{file, line_number, line}] (raises on workspace truncation unless allow_partial=True; explicit max_matches caps count without error)",
         "grep_summary(pattern, path='.', max_matches=None) -> compact grouped str (starts with TRUNCATED if incomplete)",
         "grep_read(pattern, path='.', max_files=10, context_lines=0, max_matches=None, max_bytes_read=None) -> {matches, files, summary, truncated, limit_hit, files_scanned, files_skipped}",
-        "glob_files(pattern) -> sorted list[str] (raises on truncation)",
+        "glob_files(pattern, include_ignored=False) -> sorted list[str] (raises on truncation)",
         "tree(path='.', max_depth=3) -> str (starts with TRUNCATED if incomplete)",
-        "outline(path) -> {path, total_lines, classes, functions} (Python AST classes, methods, functions, decorators, fields, line spans)",
+        "outline(path) -> {path, total_lines, classes, functions} (Python AST classes, methods, functions with parent/depth [parent=None, depth=0 for module-level], decorators, fields, line spans)",
         "enclosing(path, line) -> {line, qualified, chain, spans}",
         "find_assignments(path, target) -> list[{line_number, kind, target, enclosing, line}]",
     ]
@@ -294,6 +323,13 @@ def _initialize_session(
         "available_functions": available_functions,
         "allowed_imports": sorted(ALLOWED_MODULES),
     }
+    if has_llm_tools:
+        response["llm_budget_note"] = (
+            "For N-item recursion (rlm_recurse_batched), set max_llm_calls ≈ 4×N (~3-4 LLM calls per child)."
+        )
+    other_sessions = session_manager.list_other_session_ids(session_id)
+    if other_sessions:
+        response["other_open_sessions"] = other_sessions
     if include_guidance:
         response["strategy"] = (
             "You are exploring a codebase through code. "
@@ -309,9 +345,10 @@ def _initialize_session(
         )
         if has_llm_tools:
             response["strategy"] += (
-                " Use rlm_recurse() to delegate focused sub-questions to a recursive sub-agent, "
-                "llm_query() for flat semantic analysis on extracted snippets, "
-                "and *_batched() when analyzing multiple snippets concurrently."
+                " Use rlm_recurse_batched() (children can read code) when the child must check code, "
+                "giving each child the file path and line span (from outline), not pasted text, "
+                "and sizing max_llm_calls ≈ 4×N; use llm_query() / llm_query_batched() only when the "
+                "full context is already in the prompt."
             )
         response["example"] = (
             "# Good: orient, cast a wide net, then read only the survivors\n"
@@ -351,6 +388,8 @@ def _usage_payload(session: Session, memory_bytes_used: int) -> dict:
         "execute_calls_used": session.execute_calls,
         "execute_calls_remaining": session.max_execute_calls - session.execute_calls,
         "llm_calls_used": session.llm_calls_used,
+        "llm_calls_remaining": max(0, session.max_llm_calls - session.llm_calls_used),
+        "child_budget_exhausted": session.child_budget_exhausted,
         "memory_bytes_used": memory_bytes_used,
     }
     if session.sub_llm_usage:
@@ -378,6 +417,7 @@ def _execute_session_data(
         }
 
     session.execute_calls += 1
+    exhausted_before = session.child_budget_exhausted
     result = sandbox.execute(code)
     session.memory_bytes_used = sandbox.memory_bytes_used
 
@@ -388,10 +428,23 @@ def _execute_session_data(
     if result.final is not None:
         response["final"] = result.final
     if result.error is None:
+        warnings: list[str] = []
         remaining_calls = session.max_execute_calls - session.execute_calls
         warn_threshold = max(5, int(session.max_execute_calls * 0.15))
         if 0 < remaining_calls <= warn_threshold:
-            response["budget_warning"] = f"{remaining_calls} execute calls remaining"
+            warnings.append(f"{remaining_calls} execute calls remaining")
+        if session.llm_calls_used > 0:
+            remaining_llm = max(0, session.max_llm_calls - session.llm_calls_used)
+            llm_warn_threshold = max(5, int(session.max_llm_calls * 0.15))
+            if remaining_llm <= llm_warn_threshold:
+                warnings.append(f"{remaining_llm} LLM calls remaining (of {session.max_llm_calls})")
+        newly_exhausted = session.child_budget_exhausted - exhausted_before
+        if newly_exhausted > 0:
+            warnings.append(
+                f"{newly_exhausted} child(ren) hit the tool output budget (results marked [BUDGET_EXHAUSTED])"
+            )
+        if warnings:
+            response["budget_warning"] = "; ".join(warnings)
 
     if detail_level in {"usage", "full"}:
         response["usage"] = _usage_payload(session, result.memory_bytes_used)
@@ -472,7 +525,7 @@ async def rlm_start(
     path: Annotated[str, Field(description="Absolute path to the directory to explore")],
     query: Annotated[str, Field(description="What you want to find or analyze")],
     max_output_chars: Annotated[int, Field(description="Max characters per execute output", ge=100, le=100_000)] = 15_000,
-    max_llm_calls: Annotated[int, Field(description="Maximum model calls (llm_query, rlm_recurse, and evidence gate) for this session", ge=1, le=10_000)] = 50,
+    max_llm_calls: Annotated[int, Field(description="Maximum model calls (llm_query, rlm_recurse, and evidence gate) for this session (default 300; for N-item recursion, set max_llm_calls ≈ 4×N)", ge=1, le=10_000)] = DEFAULT_MAX_LLM_CALLS,
     max_execute_calls: Annotated[int, Field(description="Maximum rlm_execute calls for this session", ge=1, le=10_000)] = 100,
     execution_timeout_seconds: Annotated[int | None, Field(description="Per-rlm_execute timeout in seconds (defaults to 30 local, 60 external API, 180 claude-cli)", ge=1, le=600)] = None,
     include_guidance: Annotated[bool, Field(description="Include strategy/example guidance text in the response (larger payload)")] = False,

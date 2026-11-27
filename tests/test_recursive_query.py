@@ -520,7 +520,9 @@ def test_recurse_exposes_ast_helpers_caps_tool_output_and_caches_anthropic_prefi
     os.environ["RLM_CHILD_MAX_TOTAL_TOOL_CHARS"] = "180"
     try:
         recurse = make_recursive_query(client=FakeAnthropic(), helpers=helpers, model="m", max_depth=0)
-        assert recurse("check") == "done"
+        res = recurse("check")
+        assert res.startswith("[BUDGET_EXHAUSTED]")
+        assert "done" in res
     finally:
         if old_single is None:
             os.environ.pop("RLM_CHILD_MAX_TOOL_CHARS", None)
@@ -545,3 +547,55 @@ def test_recurse_exposes_ast_helpers_caps_tool_output_and_caches_anthropic_prefi
     assert "cache_control" not in t1_turn3
     assert t2_turn3["cache_control"] == {"type": "ephemeral"}
     assert "tool output budget reached" in t2_turn3["content"]
+
+
+def test_recurse_child_tool_budget_exhausted_marks_result_and_invokes_callback(monkeypatch):
+    monkeypatch.setenv("RLM_CHILD_MAX_TOTAL_TOOL_CHARS", "50")
+    monkeypatch.setenv("RLM_CHILD_MAX_TOOL_CHARS", "500")
+
+    def make_client(reply_text: str):
+        turns = [
+            _Resp([_Block("tool_use", name="read_file", input={"path": "big.py"}, id="t1")], "tool_use"),
+            _Resp([_Block("text", text=reply_text)], "end_turn"),
+        ]
+        client = MagicMock()
+        client.messages.create.side_effect = lambda **kw: turns.pop(0)
+        return client
+
+    exhausted_events = []
+    over_helpers = {"read_file": MagicMock(return_value="X" * 120)}
+    rq_over = make_recursive_query(
+        client=make_client("[]"),
+        helpers=over_helpers,
+        model="m",
+        max_depth=0,
+        on_child_budget_exhausted=lambda: exhausted_events.append(1),
+    )
+    over_result = rq_over("audit big.py")
+    assert over_result.startswith("[BUDGET_EXHAUSTED]")
+    assert "[]" in over_result
+    assert len(exhausted_events) == 1
+
+    # Also handles an empty model reply when budget was exhausted.
+    rq_empty = make_recursive_query(
+        client=make_client(""),
+        helpers=over_helpers,
+        model="m",
+        max_depth=0,
+        on_child_budget_exhausted=lambda: exhausted_events.append(1),
+    )
+    empty_result = rq_empty("audit big.py")
+    assert empty_result.startswith("[BUDGET_EXHAUSTED]")
+    assert len(exhausted_events) == 2
+
+    # Under budget: answer returned unmodified and callback is not invoked.
+    under_helpers = {"read_file": MagicMock(return_value="ok")}
+    rq_under = make_recursive_query(
+        client=make_client("clean"),
+        helpers=under_helpers,
+        model="m",
+        max_depth=0,
+        on_child_budget_exhausted=lambda: exhausted_events.append(1),
+    )
+    assert rq_under("audit small.py") == "clean"
+    assert len(exhausted_events) == 2
