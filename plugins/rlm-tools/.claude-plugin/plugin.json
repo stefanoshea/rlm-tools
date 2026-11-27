@@ -1,6 +1,6 @@
 {
   "name": "rlm-tools",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Confined Python sandbox and recursive exploration tools for token-efficient codebase analysis",
   "author": {
     "name": "Stefan O'Shea",

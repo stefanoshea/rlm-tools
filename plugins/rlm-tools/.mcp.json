@@ -2,7 +2,7 @@
   "mcpServers": {
     "rlm-tools": {
       "command": "uvx",
-      "args": ["rlm-tools==0.2.5"]
+      "args": ["rlm-tools==0.2.6"]
     }
   }
 }

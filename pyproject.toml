@@ -1,6 +1,6 @@
 [project]
 name = "rlm-tools"
-version = "0.2.5"
+version = "0.2.6"
 description = "MCP server providing a persistent Python sandbox for token-efficient codebase exploration across MCP clients"
 readme = "README.md"
 license = { file = "LICENSE" }
